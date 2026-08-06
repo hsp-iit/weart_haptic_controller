@@ -1,0 +1,36 @@
+gelsight_weart_bridge:
+  ros__parameters:
+    patch_topic: /gelsight_capture/patch
+    mask_topic: /gelsight_capture/mask
+
+    weart_ip: 127.0.0.1
+    weart_port: 13031
+    auto_start_weart: true
+    dry_run: false
+
+    hand_side: Right
+    actuation_points: [Index]
+
+    contact_mask_threshold: 0.5
+    min_contact_fraction: 0.002
+
+    # These three scales are sensor/configuration dependent. Calibrate them.
+    depth_deadband: 0.01
+    depth_full_scale: 32.0
+    area_full_scale: 1.0
+    depth_weight: 0.80
+    force_gain: 1.0
+    force_smoothing_alpha: 1.0
+
+    enable_texture: true
+    texture_type: AluminiumFineMeshSlow
+    roughness_deadband: 0.002
+    roughness_full_scale: 6.0
+    texture_gain: 1.0
+    min_texture_volume: 3.0
+    minimum_texture_velocity: 0.02
+    slip_speed_full_scale_px_s: 250.0
+
+    max_update_rate_hz: 20.0
+    input_timeout_sec: 0.30
+    debug_log_period_sec: 1.0
