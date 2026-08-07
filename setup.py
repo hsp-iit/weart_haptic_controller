@@ -22,6 +22,8 @@ setup(
     entry_points={
         "console_scripts": [
             "bridge_node = gelsight_weart_bridge.bridge_node:main",
+            "bridge_node_dummy = gelsight_weart_bridge.bridge_node_dummy:main",
+            "tactile_sensor_dummy = gelsight_weart_bridge.tactile_sensor_dummy:main",
         ],
     },
 )
