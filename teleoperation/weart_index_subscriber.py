@@ -110,12 +110,12 @@ MAX_DT_S = 0.25
 THETA_SIGMA_RAD = np.deg2rad(4.0)
 TOF_SIGMA_MM = 4.0
 SMOOTH_SIGMA_RAD = np.deg2rad(22.0)
- 
+
 # Human DIP flexion normally follows PIP flexion. This resolves the otherwise
 # ambiguous q2/q3 split from a single IMU orientation and ToF range.
 DIP_TO_PIP_RATIO = 0.67
 DIP_COUPLING_SIGMA_RAD = np.deg2rad(12.0)
- 
+
 # =============================================================================
 # STARTUP CALIBRATION
 # =============================================================================
@@ -347,7 +347,7 @@ class IndexEstimator:
         num = ACC_ANGLE_NUM_SIGN * float(acc[ACC_ANGLE_NUM_AXIS])
         den = ACC_ANGLE_DEN_SIGN * float(acc[ACC_ANGLE_DEN_AXIS])
         return math.atan2(num, den)
- 
+
 # calibration samples 30
     def _sample_is_good_for_calibration(self, s: WeartSample) -> bool:
         return (
@@ -394,7 +394,7 @@ class IndexEstimator:
             return 0.01
  
         return float(np.clip(dt, MIN_DT_S, MAX_DT_S))
-# Integral of the gyro flexion axis, corrected by the accelerometer when near 1 g.
+ # Integral of the gyro flexion axis, corrected by the accelerometer when near 1 g.
     def _update_theta(self, s: WeartSample, dt: float) -> float:
         gyro_flex_deg_s = (
             GYRO_FLEX_SIGN * float(s.gyro_deg_s[GYRO_FLEX_AXIS])
@@ -422,7 +422,7 @@ class IndexEstimator:
  
         self.theta = wrap_pi(theta_gyro + correction)
         return self.theta
-# least square error
+ # least square error
     def _residual(
         self,
         q: np.ndarray,
@@ -439,13 +439,13 @@ class IndexEstimator:
  
         # Kinematic branch / temporal continuity.
         r_smooth = (q - q_prev) / SMOOTH_SIGMA_RAD
- 
+
         # Prefer physiological PIP/DIP sharing, rather than assigning all
         # flexion to q1 and q2 while leaving q3 at zero.
         r_dip_coupling = (
             float(q[2]) - DIP_TO_PIP_RATIO * float(q[1])
         ) / DIP_COUPLING_SIGMA_RAD
- 
+
         return np.concatenate(
             (
                 np.array([r_theta, r_tof, r_dip_coupling], dtype=float),
