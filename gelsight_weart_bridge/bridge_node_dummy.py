@@ -7,10 +7,9 @@ import threading
 import time
 from typing import Optional
 
-import numpy as np
 import rclpy
+from geometry_msgs.msg import Vector3
 from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray
 from weartsdk import (
     MiddlewareStatusListener,
     TouchEffect,
@@ -44,7 +43,7 @@ class BridgeNodeDummy(Node):
             self._initialize_weart()
 
         self._subscription = self.create_subscription(
-            Float32MultiArray,
+            Vector3,
             self.force_topic,
             self._on_force_vector,
             10,
@@ -58,7 +57,7 @@ class BridgeNodeDummy(Node):
 
     def _declare_parameters(self) -> None:
         parameters = [
-            ("force_topic", "/dummy_tactile/force_vector"),
+            ("force_topic", "/gelsight_processed/force"),
             ("weart_ip", "127.0.0.1"),
             ("weart_port", 13031),
             ("auto_start_weart", True),
@@ -168,32 +167,24 @@ class BridgeNodeDummy(Node):
                 self._weart_started = True
                 self.get_logger().info("WEART middleware RUNNING; ready to send forces")
 
-    def _on_force_vector(self, msg: Float32MultiArray) -> None:
+    def _on_force_vector(self, msg: Vector3) -> None:
         now = time.monotonic()
         self._last_update_monotonic = now
 
-        if len(msg.data) == 0:
-            self.get_logger().warning("Received empty force vector; stopping effect")
-            self._stop_effect()
-            return
-
-        values = np.asarray(msg.data, dtype=np.float32)
         if not self._received_first_force:
             self._received_first_force = True
             self.get_logger().info(
                 f"Received first force message from {self.force_topic}"
             )
 
-        self.get_logger().info(
-            f"Received force vector, size={values.size}, mean={float(np.mean(values)):.3f}"
-        )
-        if values.size == 0:
-            self.get_logger().warning("Received empty force vector; stopping effect")
-            self._stop_effect()
-            return
+        z_value = float(msg.z)
+        force_value = z_value / -19.0
+        force_value = max(0.0, min(1.0, force_value))
 
-        force_value = float(np.clip(np.mean(values), 0.0, 1.0))
-        self.get_logger().debug(f"Computed mean force value: {force_value:.3f}")
+        self.get_logger().info(
+            f"Received force vector z={z_value:.3f}; mapped force={force_value:.3f}"
+        )
+
         if force_value <= 1.0e-3:
             self.get_logger().debug("Force value below threshold; stopping effect")
             self._stop_effect()

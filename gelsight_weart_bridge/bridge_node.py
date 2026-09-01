@@ -313,6 +313,12 @@ class GelSightWeartBridge(Node):
             return
 
         z = patch_xyz[:, 2]
+        self.get_logger().info(
+            f"z: min={z.min():.3f}, "
+            f"max={z.max():.3f}, "
+            f"mean={z.mean():.3f}, "
+            f"std={z.std():.3f}"
+        )
         non_contact = ~contact
         if np.count_nonzero(non_contact) >= max(20, int(0.01 * z.size)):
             baseline = float(np.median(z[non_contact]))
@@ -335,6 +341,13 @@ class GelSightWeartBridge(Node):
         depth_normalized = self._normalize(
             indentation, self.depth_deadband, self.depth_full_scale
         )
+        if depth_normalized <= 0.0:
+            self._previous_centroid = None
+            self._previous_stamp = None
+            self._smoothed_force = 0.0
+            self._stop_effect()
+            return
+
         area_normalized = float(
             np.clip(contact_fraction / self.area_full_scale, 0.0, 1.0)
         )
@@ -365,6 +378,19 @@ class GelSightWeartBridge(Node):
             texture_velocity = max(
                 self.minimum_texture_velocity, texture_velocity
             )
+
+        self.get_logger().info(
+            f"""
+            baseline={baseline:.3f}
+            contact={contact_level:.3f}
+            indent={indentation:.3f}
+            depth_norm={depth_normalized:.3f}
+            area={contact_fraction:.3f}
+            area_norm={area_normalized:.3f}
+            raw_force={raw_force:.3f}
+            smooth={self._smoothed_force:.3f}
+            """
+        )
 
         self._send_haptics(
             force_value=self._smoothed_force,

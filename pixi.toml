@@ -9,6 +9,7 @@ version = "0.1.0"
 [dependencies]
 ros-jazzy-desktop = ">=0.11.0,<0.12"
 ros-jazzy-turtlesim = ">=1.8.3,<2"
+scipy = ">=1.18.0,<2"
 
 [pypi-dependencies]
 weartsdk = ">=2.0.3, <3"

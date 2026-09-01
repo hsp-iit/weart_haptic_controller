@@ -11,7 +11,7 @@ gelsight_weart_bridge:
     hand_side: Right
     actuation_points: [Index]
 
-    contact_mask_threshold: 0.5
+    contact_mask_threshold: 0.7
     min_contact_fraction: 0.002
 
     # These three scales are sensor/configuration dependent. Calibrate them.
