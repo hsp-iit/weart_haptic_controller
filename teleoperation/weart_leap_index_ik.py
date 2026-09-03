@@ -74,7 +74,7 @@ from std_msgs.msg import Float64MultiArray, String
 
 DEFAULT_INPUT_TOPIC = "/weart/index/raw"
 DEFAULT_OUTPUT_TOPIC = "/weart/index/estimated_leap_joints"
-DEFAULT_URDF_PATH = str(Path(__file__).with_name("leap_hand_right.urdf"))
+DEFAULT_URDF_PATH = str(Path(__file__).with_name("model.urdf"))
 
 DEFAULT_ENABLE_HARDWARE = False
 DEFAULT_LEAP_PORT = ""
@@ -899,6 +899,20 @@ class DirectLeapIndexDriver:
             self._ctrl.disconnect()
             self._ctrl = None
             print("[LEAP] disconnected.", flush=True)
+
+    def read_actual_sim_qpos(self) -> np.ndarray | None:
+        """Read all physical joints and convert motor coordinates to URDF q."""
+        if self._ctrl is None:
+            return None
+        motor_qpos = np.asarray(self._ctrl.read_pos(), dtype=float).reshape(-1)
+        if motor_qpos.size != self.kin.motor_count:
+            raise ValueError(
+                f"LEAP returned {motor_qpos.size} joints, "
+                f"expected {self.kin.motor_count}"
+            )
+        if not np.all(np.isfinite(motor_qpos)):
+            raise ValueError("LEAP returned non-finite joint positions")
+        return motor_qpos - math.pi
 
     def command(
         self,
