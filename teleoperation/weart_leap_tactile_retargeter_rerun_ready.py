@@ -809,21 +809,38 @@ class WeartLeapRetargetingNode(Node):
 
         self.enable_hardware = bool(self.get_parameter("enable_hardware").value)
 
-        # Pinocchio already loaded the 16 joint limits from the same URDF.
-        # Use the URDF velocity limits as the first safety bound.
-        velocity_limits = np.zeros(self.retargeter.model.nq, dtype=float)
-        for joint_id, joint_name in enumerate(self.retargeter.model.names):
-            if joint_id == 0:
-                continue
+        # IMPORTANT:
+        # Pinocchio's internal q order is NOT guaranteed to be numeric joint
+        # order 0..15. The physical LEAP API / leap_sim_to_motor expects the
+        # vector in LEAP numeric joint order. Build hardware-side arrays
+        # explicitly in that order.
+        hardware_lower = np.array(
+            [
+                self.retargeter.lower[self.retargeter.q_index(str(i))]
+                for i in range(16)
+            ],
+            dtype=float,
+        )
+        hardware_upper = np.array(
+            [
+                self.retargeter.upper[self.retargeter.q_index(str(i))]
+                for i in range(16)
+            ],
+            dtype=float,
+        )
+
+        velocity_limits = np.zeros(16, dtype=float)
+        for i in range(16):
+            joint_name = str(i)
+            joint_id = self.retargeter.model.getJointId(joint_name)
             joint = self.retargeter.model.joints[joint_id]
-            if joint.nq == 1:
-                velocity_limits[joint.idx_q] = float(
-                    self.retargeter.model.velocityLimit[joint.idx_v]
-                )
+            velocity_limits[i] = float(
+                self.retargeter.model.velocityLimit[joint.idx_v]
+            )
 
         self.leap = DirectLeapFullHandDriver(
-            self.retargeter.lower,
-            self.retargeter.upper,
+            hardware_lower,
+            hardware_upper,
             velocity_limits,
             enabled=self.enable_hardware,
             port=str(self.get_parameter("leap_port").value),
@@ -893,6 +910,9 @@ class WeartLeapRetargetingNode(Node):
         )
         if self.enable_hardware:
             self.get_logger().warn("LEAP HARDWARE OUTPUT ENABLED.")
+            self.get_logger().info(
+                "Hardware command order: explicit LEAP numeric joints [0..15]."
+            )
         else:
             self.get_logger().warn(
                 "Dry-run mode: publishing targets for Rerun/ROS only; "
@@ -985,7 +1005,10 @@ class WeartLeapRetargetingNode(Node):
                 dt = max(now_s - self.last_control_time_s, MIN_DT_S)
                 self.last_control_time_s = now_s
 
-                q_commanded = self.leap.command(q, dt)
+                # q is in Pinocchio internal order. msg.data was already
+                # reordered explicitly to LEAP joints [0, 1, ..., 15].
+                q_leap_numeric = np.asarray(msg.data, dtype=float)
+                q_commanded = self.leap.command(q_leap_numeric, dt)
             except Exception as exc:
                 self.get_logger().error(
                     f"LEAP hardware command failed: {exc}",
