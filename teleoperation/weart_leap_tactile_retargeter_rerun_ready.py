@@ -67,7 +67,12 @@ try:
         leap_sim_to_motor,
     )
     HARDWARE_DRIVER_AVAILABLE = True
-except Exception:
+except Exception as exc:
+    print(
+        f"[LEAP] hardware helpers unavailable ({exc!r}); "
+        "falling back to dry-run defaults.",
+        flush=True,
+    )
     COMMAND_LOW_PASS_ALPHA = 1.0
     COMMAND_MAX_SPEED_RAD_S = 4.0
     DEFAULT_KD = 0.0
@@ -285,18 +290,24 @@ class LeapRetargeter:
 
         # Weights act on RESIDUALS, therefore their squares contribute to cost.
         self.w_closure = 8.0
-        self.w_adduction = 3.0 #4.0
+        self.w_adduction = 3.0 # 3.0 #4.0
         # Keep this OFF while visually verifying the tactile-pad normal in Rerun.
         # After identifying the correct local normal for each fingertip, set
         # this back to e.g. 1.5.
-        self.w_tactile = 0.5
-        self.w_posture = 0.350 #0.35
-        self.w_smooth = 0.5 #0.50
+        self.w_tactile = 0.5 #1.5
+        self.w_posture = 0.35 # 0.350 #0.35
+        self.w_smooth = 1.0 #0/.5 #0.50
         self.w_joint_margin = 0.0 #0.20
         # Keep unobserved lateral DoFs near neutral so the tactile term
         # cannot move index/middle sideways just to improve pad orientation.
-        self.w_lateral = 3.0 #2.0
-        self.w_opposition = 1.0
+        self.w_lateral = 1.0
+
+        # Thumb-index tactile pinch geometry.
+        # Separate weights make geometric fine tuning explicit.
+        self.w_axis_alignment = 0.5
+        self.w_facing_normals = 2.0
+        self.w_gap = 0.2
+
         self.index_lateral_neutral = 0.0
         self.middle_lateral_neutral = 0.0
 
@@ -484,44 +495,75 @@ class LeapRetargeter:
         return p, n
 
 
-    def thumb_index_opposition_residuals(
+    def thumb_index_pinch_residuals(
         self,
         q: np.ndarray,
-    ) -> np.ndarray:
+        thumb_closure: float,
+        index_closure: float,
+    ):
         """
-        Encourage thumb and index tactile pads to face each other.
+        Thumb-index tactile pinch geometry.
 
-        Let d be the direction from thumb -> index.
-        Desired:
-            thumb normal ≈  d
-            index normal ≈ -d
+        The index tactile pad defines the reference axis.
+
+        Returns:
+            axis_res: 3D normalized lateral/off-axis displacement.
+            facing_res: scalar orientation residual, zero for opposite normals.
+            gap_res: scalar soft minimum-gap violation.
         """
-
         thumb_cfg = self.fingers["thumb"]
         index_cfg = self.fingers["index"]
 
-        p_thumb, n_thumb = self.fingertip_position_and_normal(
-            q,
-            thumb_cfg,
+        p_thumb, n_thumb = self.fingertip_position_and_normal(q, thumb_cfg)
+        p_index, n_index = self.fingertip_position_and_normal(q, index_cfg)
+
+        # 1) AXIS ALIGNMENT
+        # v_perp is the component of thumb-index displacement perpendicular
+        # to the index tactile normal. Zero means both pad centers lie on the
+        # same tactile-normal axis.
+        v = p_thumb - p_index
+        v_parallel = float(np.dot(v, n_index)) * n_index
+        v_perp = v - v_parallel
+        axis_scale_m = 0.030  # normalization scale, not a desired gap
+        axis_res = v_perp / axis_scale_m
+
+        # 2) FACING NORMALS
+        # Ideal: n_thumb = -n_index -> dot = -1 -> residual = 0.
+        facing_res = 1.0 + float(np.dot(n_thumb, n_index))
+
+        # 3) TARGET GAP DRIVEN BY HUMAN CLOSURE
+        # Distance between the pad centers measured along the index normal.
+        gap_m = abs(float(np.dot(v, n_index)))
+
+        # Average human closure of thumb and index.
+        c_pair = clamp(
+            0.5 * (float(thumb_closure) + float(index_closure)),
+            0.0,
+            1.0,
         )
 
-        p_index, n_index = self.fingertip_position_and_normal(
-            q,
-            index_cfg,
+        # Desired separation between tactile pads:
+        #   fully open pair   -> about 100 mm
+        #   fully closed pair -> about 10 mm
+        #
+        # This is a generic geometry prior, not an object-size estimate.
+        gap_open_m = 0.100
+        gap_closed_m = 0.010
+
+        target_gap_m = (
+            gap_open_m * (1.0 - c_pair)
+            + gap_closed_m * c_pair
         )
 
-        d = normalize(p_index - p_thumb)
+        # Signed normalized error:
+        #   > 0 : pads are farther apart than desired
+        #   < 0 : pads are closer than desired
+        #   = 0 : desired gap reached
+        gap_scale_m = 0.050
+        gap_res = (gap_m - target_gap_m) / gap_scale_m
 
-        if np.linalg.norm(d) < 1e-9:
-            return np.zeros(2, dtype=float)
+        return axis_res, facing_res, gap_res
 
-        thumb_res = 1.0 - float(np.dot(n_thumb, d))
-        index_res = 1.0 - float(np.dot(n_index, -d))
-
-        return np.array(
-            [thumb_res, index_res],
-            dtype=float,
-        )
     # -----------------------------------------------------------------------
     # Joint-limit safety
     # -----------------------------------------------------------------------
@@ -603,34 +645,32 @@ class LeapRetargeter:
                 * self.tactile_cone_residual(q, cfg)
             )
         # ---------------------------------------------------------------
-        # SECONDARY: thumb-index opposition
+        # SECONDARY: thumb-index tactile pinch geometry
         # ---------------------------------------------------------------
         thumb_sample = samples.get("thumb")
         index_sample = samples.get("index")
 
         if thumb_sample is not None and index_sample is not None:
+            g_thumb = self.tactile_activation(thumb_sample.closure)
+            g_index = self.tactile_activation(index_sample.closure)
+            g_pair = math.sqrt(g_thumb * g_index)
 
-            g_thumb = self.tactile_activation(
-                thumb_sample.closure
+            axis_res, facing_res, gap_res = self.thumb_index_pinch_residuals(
+                q,
+                thumb_sample.closure,
+                index_sample.closure,
             )
-
-            g_index = self.tactile_activation(
-                index_sample.closure
-            )
-
-            g_opposition = math.sqrt(
-                g_thumb * g_index
-            )
-
-            opp_res = self.thumb_index_opposition_residuals(q)
 
             residuals.extend(
-                (
-                    g_opposition
-                    * self.w_opposition
-                    * opp_res
-                ).tolist()
+                (g_pair * self.w_axis_alignment * axis_res).tolist()
             )
+            residuals.append(
+                g_pair * self.w_facing_normals * facing_res
+            )
+            residuals.append(
+                g_pair * self.w_gap * gap_res
+            )
+
         # ---------------------------------------------------------------
         # SECONDARY: neutral lateral posture for unobserved DoFs
         # ---------------------------------------------------------------
@@ -721,6 +761,88 @@ class LeapRetargeter:
                 self.tactile_activation(samples[finger_name].closure)
             )
 
+        p_thumb, n_thumb = self.fingertip_position_and_normal(
+            q_solution, self.fingers["thumb"]
+        )
+        p_index, n_index = self.fingertip_position_and_normal(
+            q_solution, self.fingers["index"]
+        )
+        # Use fingertip frame origins as pad positions (URDF units: metres).
+        # Positive gap: thumb lies on the outward-normal side of the index.
+        delta = p_thumb - p_index
+        gap = float(np.dot(delta, n_index))
+        diagnostics["axis_err_mm"] = 1000.0 * float(
+            np.linalg.norm(delta - gap * n_index)
+        )
+        diagnostics["facing_err_deg"] = math.degrees(
+            math.acos(clamp(float(np.dot(n_thumb, -n_index)), -1.0, 1.0))
+        )
+        diagnostics["gap_mm"] = 1000.0 * gap
+
+
+        thumb_sample = samples["thumb"]
+        index_sample = samples["index"]
+
+        # ---------------------------------------------------------------
+        # Pair gating
+        # ---------------------------------------------------------------
+        g_thumb = self.tactile_activation(thumb_sample.closure)
+        g_index = self.tactile_activation(index_sample.closure)
+
+        g_pair = math.sqrt(g_thumb * g_index)
+
+        # Weighted pinch-geometry residual magnitudes used by the solver.
+        axis_res, facing_res, gap_res = self.thumb_index_pinch_residuals(
+            q_solution,
+            thumb_sample.closure,
+            index_sample.closure,
+        )
+        diagnostics["axis_cost"] = (
+            g_pair * self.w_axis_alignment * float(np.linalg.norm(axis_res))
+        )
+        diagnostics["facing_cost"] = (
+            g_pair * self.w_facing_normals * abs(float(facing_res))
+        )
+        diagnostics["gap_cost"] = (
+            g_pair * self.w_gap * abs(float(gap_res))
+        )
+
+        for finger_name in ("thumb", "index", "middle"):
+            cfg = self.fingers[finger_name]
+            sample = samples[finger_name]
+
+            c_target = self.shape_closure(sample.closure)
+            c_robot = self.robot_closure(q_solution, cfg)
+
+            diagnostics[f"{finger_name}_closure_target"] = c_target
+
+            diagnostics[f"{finger_name}_closure_cost"] = (
+                self.w_closure
+                * abs(c_robot - c_target)
+            )
+
+        thumb_cfg = self.fingers["thumb"]
+        idx = self.q_index(thumb_cfg.adduction_joint_name)
+
+        desired_add = self.weart_thumb_adduction_to_leap(
+            thumb_sample.adduction
+        )
+
+        add_scale = max(
+            abs(
+                thumb_cfg.q_adduct_max
+                - thumb_cfg.q_adduct_min
+            ),
+            1e-6,
+        )
+
+        diagnostics["thumb_adduction_cost"] = (
+            self.w_adduction
+            * abs(
+                (q_solution[idx] - desired_add)
+                / add_scale
+            )
+        )
         return q_solution, diagnostics
 
 
@@ -777,7 +899,7 @@ class DirectLeapFullHandDriver:
 
         self.port = autodetect_leap_port(self.requested_port)
         leap_cpp = _load_leap_cpp()
-        self._ctrl = leap_cpp.LeapController(self.port, self.baudrate)
+        self._ctrl = leap_cpp.LeapController(self.port)
         self._ctrl.connect()
         self._ctrl.setGains(int(self.kp), int(self.ki), int(self.kd))
 
@@ -1124,9 +1246,21 @@ class WeartLeapRetargetingNode(Node):
                         f"middle: c={diag['middle_closure_robot']:.2f}, "
                         f"tact={diag['middle_tactile_angle_deg']:.1f}deg, "
                         f"gate={diag['middle_tactile_activation']:.2f}",
+                        f"thumb-index: axis={diag['axis_err_mm']:.1f} mm | "
+                        f"facing={diag['facing_err_deg']:.1f} deg | "
+                        f"gap={diag['gap_mm']:.1f} mm",
                     ]
                 )
             )
+            self.get_logger().info(
+                 "COSTS | "
+                 f"axis={diag['axis_cost']:.3f} | "
+                 f"facing={diag['facing_cost']:.3f} | "
+                 f"gap={diag['gap_cost']:.3f} | "
+                 f"cl_thumb={diag['thumb_closure_cost']:.3f} | "
+                 f"cl_index={diag['index_closure_cost']:.3f} | "
+                 f"add_thumb={diag['thumb_adduction_cost']:.3f}"
+             )
 
 
 def main(args=None):
