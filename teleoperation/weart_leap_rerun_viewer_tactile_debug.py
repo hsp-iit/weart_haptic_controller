@@ -14,7 +14,9 @@ topics remain available as an optional fallback.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import math
+import os
 import tempfile
 import time
 import xml.etree.ElementTree as ET
@@ -43,6 +45,21 @@ HAND_COLORS = {
     "target": [255, 95, 55, 125],
     "actual": [45, 185, 255, 180],
 }
+
+
+class _CleanRerunSpawnEnv:
+    """Avoid leaking this Pixi env's Python paths into Rerun's viewer process."""
+
+    def __enter__(self):
+        self._pythonpath = os.environ.pop("PYTHONPATH", None)
+        self._pythonhome = os.environ.pop("PYTHONHOME", None)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._pythonpath is not None:
+            os.environ["PYTHONPATH"] = self._pythonpath
+        if self._pythonhome is not None:
+            os.environ["PYTHONHOME"] = self._pythonhome
 
 TARGET_INDICES = {
     "index": (1, 2, 3),
@@ -290,7 +307,8 @@ class RerunLeapPosePair:
         self.prepared_urdf = prepare_urdf_for_rerun(urdf_path, mesh_directory)
 
         if not rr.is_enabled():
-            rr.init("weart_leap_target_actual", spawn=spawn_viewer)
+            with _CleanRerunSpawnEnv() if spawn_viewer else nullcontext():
+                rr.init("weart_leap_target_actual", spawn=spawn_viewer)
         self.recording = rr.get_global_data_recording()
         self.start_time = time.perf_counter()
 

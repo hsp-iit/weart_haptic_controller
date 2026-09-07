@@ -59,6 +59,7 @@ try:
         DEFAULT_KD,
         DEFAULT_KI,
         DEFAULT_KP,
+        DEFAULT_LEAP_BAUDRATE,
         DEFAULT_LEAP_PORT,
         MIN_DT_S,
         _load_leap_cpp,
@@ -72,6 +73,7 @@ except Exception:
     DEFAULT_KD = 0.0
     DEFAULT_KI = 0.0
     DEFAULT_KP = 0.0
+    DEFAULT_LEAP_BAUDRATE = 4000000
     DEFAULT_LEAP_PORT = ""
     MIN_DT_S = 0.002
     _load_leap_cpp = None
@@ -283,17 +285,18 @@ class LeapRetargeter:
 
         # Weights act on RESIDUALS, therefore their squares contribute to cost.
         self.w_closure = 8.0
-        self.w_adduction = 4.0
+        self.w_adduction = 3.0 #4.0
         # Keep this OFF while visually verifying the tactile-pad normal in Rerun.
         # After identifying the correct local normal for each fingertip, set
         # this back to e.g. 1.5.
         self.w_tactile = 0.5
-        self.w_posture = 0.35
-        self.w_smooth = 0.50
-        self.w_joint_margin = 0.20
+        self.w_posture = 0.350 #0.35
+        self.w_smooth = 0.5 #0.50
+        self.w_joint_margin = 0.0 #0.20
         # Keep unobserved lateral DoFs near neutral so the tactile term
         # cannot move index/middle sideways just to improve pad orientation.
-        self.w_lateral = 4.0
+        self.w_lateral = 3.0 #2.0
+        self.w_opposition = 1.0
         self.index_lateral_neutral = 0.0
         self.middle_lateral_neutral = 0.0
 
@@ -461,6 +464,64 @@ class LeapRetargeter:
         theta_max = math.radians(cfg.tactile_cone_deg)
         return soft_hinge(theta - theta_max)
 
+    def fingertip_position_and_normal(
+        self,
+        q: np.ndarray,
+        cfg: FingerConfig,
+    ):
+        pin.forwardKinematics(self.model, self.data, q)
+        pin.updateFramePlacements(self.model, self.data)
+
+        tip_id = self.model.getFrameId(cfg.frame_name)
+        tip_pose = self.data.oMf[tip_id]
+
+        p = tip_pose.translation.copy()
+
+        n = normalize(
+            tip_pose.rotation @ cfg.sensor_normal_local
+        )
+
+        return p, n
+
+
+    def thumb_index_opposition_residuals(
+        self,
+        q: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Encourage thumb and index tactile pads to face each other.
+
+        Let d be the direction from thumb -> index.
+        Desired:
+            thumb normal ≈  d
+            index normal ≈ -d
+        """
+
+        thumb_cfg = self.fingers["thumb"]
+        index_cfg = self.fingers["index"]
+
+        p_thumb, n_thumb = self.fingertip_position_and_normal(
+            q,
+            thumb_cfg,
+        )
+
+        p_index, n_index = self.fingertip_position_and_normal(
+            q,
+            index_cfg,
+        )
+
+        d = normalize(p_index - p_thumb)
+
+        if np.linalg.norm(d) < 1e-9:
+            return np.zeros(2, dtype=float)
+
+        thumb_res = 1.0 - float(np.dot(n_thumb, d))
+        index_res = 1.0 - float(np.dot(n_index, -d))
+
+        return np.array(
+            [thumb_res, index_res],
+            dtype=float,
+        )
     # -----------------------------------------------------------------------
     # Joint-limit safety
     # -----------------------------------------------------------------------
@@ -541,7 +602,35 @@ class LeapRetargeter:
                 * self.w_tactile
                 * self.tactile_cone_residual(q, cfg)
             )
+        # ---------------------------------------------------------------
+        # SECONDARY: thumb-index opposition
+        # ---------------------------------------------------------------
+        thumb_sample = samples.get("thumb")
+        index_sample = samples.get("index")
 
+        if thumb_sample is not None and index_sample is not None:
+
+            g_thumb = self.tactile_activation(
+                thumb_sample.closure
+            )
+
+            g_index = self.tactile_activation(
+                index_sample.closure
+            )
+
+            g_opposition = math.sqrt(
+                g_thumb * g_index
+            )
+
+            opp_res = self.thumb_index_opposition_residuals(q)
+
+            residuals.extend(
+                (
+                    g_opposition
+                    * self.w_opposition
+                    * opp_res
+                ).tolist()
+            )
         # ---------------------------------------------------------------
         # SECONDARY: neutral lateral posture for unobserved DoFs
         # ---------------------------------------------------------------
@@ -655,6 +744,7 @@ class DirectLeapFullHandDriver:
         *,
         enabled: bool,
         port: str,
+        baudrate: int,
         kp: float,
         ki: float,
         kd: float,
@@ -665,6 +755,7 @@ class DirectLeapFullHandDriver:
 
         self.enabled = bool(enabled)
         self.requested_port = str(port)
+        self.baudrate = int(baudrate)
         self.kp = float(kp)
         self.ki = float(ki)
         self.kd = float(kd)
@@ -686,14 +777,15 @@ class DirectLeapFullHandDriver:
 
         self.port = autodetect_leap_port(self.requested_port)
         leap_cpp = _load_leap_cpp()
-        self._ctrl = leap_cpp.LeapController(self.port)
+        self._ctrl = leap_cpp.LeapController(self.port, self.baudrate)
         self._ctrl.connect()
         self._ctrl.setGains(int(self.kp), int(self.ki), int(self.kd))
 
         # Start from the current neutral/open command.
         self._ctrl.set_leap(leap_sim_to_motor(self.current_sim_qpos))
         print(
-            f"[LEAP] connected on {self.port}; sent initial open pose.",
+            f"[LEAP] connected on {self.port} at {self.baudrate} baud; "
+            "sent initial open pose.",
             flush=True,
         )
 
@@ -782,6 +874,7 @@ class WeartLeapRetargetingNode(Node):
         self.declare_parameter("control_rate_hz", 30.0)
         self.declare_parameter("enable_hardware", False)
         self.declare_parameter("leap_port", DEFAULT_LEAP_PORT)
+        self.declare_parameter("leap_baudrate", DEFAULT_LEAP_BAUDRATE)
         self.declare_parameter("kp", DEFAULT_KP)
         self.declare_parameter("ki", DEFAULT_KI)
         self.declare_parameter("kd", DEFAULT_KD)
@@ -844,6 +937,7 @@ class WeartLeapRetargetingNode(Node):
             velocity_limits,
             enabled=self.enable_hardware,
             port=str(self.get_parameter("leap_port").value),
+            baudrate=int(self.get_parameter("leap_baudrate").value),
             kp=float(self.get_parameter("kp").value),
             ki=float(self.get_parameter("ki").value),
             kd=float(self.get_parameter("kd").value),
