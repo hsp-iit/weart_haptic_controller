@@ -283,6 +283,31 @@ class LeapRetargeter:
         # Start close to a neutral/open pose.
         self.q_prev = pin.neutral(self.model)
 
+        # Determine the natural index-middle lateral ordering from the neutral pose.
+        # We measure the relative fingertip displacement in the PALM frame and
+        # use its dominant lateral component sign as the reference ordering.
+        pin.forwardKinematics(self.model, self.data, self.q_prev)
+        pin.updateFramePlacements(self.model, self.data)
+
+        palm_pose_neutral = self.data.oMf[self.palm_frame_id]
+        p_index_neutral = self.data.oMf[
+            self.model.getFrameId(self.fingers["index"].frame_name)
+        ].translation
+        p_middle_neutral = self.data.oMf[
+            self.model.getFrameId(self.fingers["middle"].frame_name)
+        ].translation
+
+        delta_im_world = p_middle_neutral - p_index_neutral
+        delta_im_palm = palm_pose_neutral.rotation.T @ delta_im_world
+
+        # For the LEAP hand, the palm-frame Y axis is used as the lateral axis.
+        # The sign is inferred automatically from the neutral pose.
+        self.index_middle_lateral_axis_palm = np.array([0.0, 1.0, 0.0])
+        neutral_signed_sep = float(
+            np.dot(delta_im_palm, self.index_middle_lateral_axis_palm)
+        )
+        self.index_middle_order_sign = 1.0 if neutral_signed_sep >= 0.0 else -1.0
+
         # Cache joint bounds from URDF.
         self.lower = np.asarray(self.model.lowerPositionLimit, dtype=float).copy()
         self.upper = np.asarray(self.model.upperPositionLimit, dtype=float).copy()
@@ -301,15 +326,39 @@ class LeapRetargeter:
         self.w_posture = 0.35 # 0.350 #0.35
         self.w_smooth = 1.0 #0/.5 #0.50
         self.w_joint_margin = 0.0 #0.20
-        # Keep unobserved lateral DoFs near neutral so the tactile term
-        # cannot move index/middle sideways just to improve pad orientation.
-        self.w_lateral = 1.0
+        # Index/middle lateral DoFs (q0, q4) are not directly observed by WEART.
+        # Keep them near neutral when the fingers are open, but progressively
+        # release them during grasp so robot-specific tactile geometry can use them.
+        self.w_lateral_open = 1.0
+        self.w_lateral_grasp = 0.20
 
-        # Thumb-index tactile pinch geometry.
-        # Separate weights make geometric fine tuning explicit.
-        self.w_axis_alignment = 0.0 #0.5
-        self.w_facing_normals = 0.0 #2.0
-        self.w_gap = 0.0 #0.2
+        # Tri-digit tactile grasp geometry.
+        # Thumb-index is the primary pair; thumb-middle is a softer stabilizing pair.
+        self.w_axis_TI = 0.15
+        self.w_face_TI = 0.30
+        self.w_gap_TI = 0.20
+
+        self.w_axis_TM = 0.10
+        self.w_face_TM = 0.25
+        self.w_gap_TM = 0.15
+
+        # Prevent index and middle from collapsing onto each other.
+        self.w_index_middle_spread = 0.50
+
+        # Preserve the anatomical lateral ordering of index and middle.
+        # q0/q4 remain free to move, but the fingertips should not cross/swap sides.
+        self.w_index_middle_order = 2.0
+        self.index_middle_order_margin_m = 0.010  # 10 mm signed lateral margin
+        self.index_middle_order_scale_m = 0.020   # normalization scale
+
+        # Axis alignment is a soft envelope, not a "perfect collinearity" target.
+        self.axis_tolerance_TI_m = 0.020   # 20 mm
+        self.axis_tolerance_TM_m = 0.030   # 30 mm
+        self.axis_scale_m = 0.030          # normalization scale
+
+        # Soft minimum index-middle fingertip spacing.
+        self.index_middle_min_spread_m = 0.025  # 25 mm
+        self.index_middle_spread_scale_m = 0.025
 
         self.index_lateral_neutral = 0.0
         self.middle_lateral_neutral = 0.0
@@ -498,58 +547,70 @@ class LeapRetargeter:
         return p, n
 
 
-    def thumb_index_pinch_residuals(
+    def finger_pair_grasp_residuals(
         self,
         q: np.ndarray,
-        thumb_closure: float,
-        index_closure: float,
+        reference_name: str,
+        other_name: str,
+        reference_closure: float,
+        other_closure: float,
+        axis_tolerance_m: float,
     ):
         """
-        Thumb-index tactile pinch geometry.
+        Generic tactile pair geometry.
 
-        The index tactile pad defines the reference axis.
+        The reference finger defines the tactile-normal axis.
 
         Returns:
-            axis_res: 3D normalized lateral/off-axis displacement.
-            facing_res: scalar orientation residual, zero for opposite normals.
-            gap_res: scalar soft minimum-gap violation.
+            axis_res:
+                scalar soft off-axis residual. Zero inside a tolerance tube.
+            facing_res:
+                scalar orientation residual. Zero when pad normals are opposite.
+            gap_res:
+                scalar target-gap residual driven by the two human closures.
+            raw_axis_m:
+                raw off-axis error in metres.
+            raw_gap_m:
+                raw separation along the reference tactile normal in metres.
         """
-        thumb_cfg = self.fingers["thumb"]
-        index_cfg = self.fingers["index"]
+        ref_cfg = self.fingers[reference_name]
+        other_cfg = self.fingers[other_name]
 
-        p_thumb, n_thumb = self.fingertip_position_and_normal(q, thumb_cfg)
-        p_index, n_index = self.fingertip_position_and_normal(q, index_cfg)
+        p_ref, n_ref = self.fingertip_position_and_normal(q, ref_cfg)
+        p_other, n_other = self.fingertip_position_and_normal(q, other_cfg)
 
-        # 1) AXIS ALIGNMENT
-        # v_perp is the component of thumb-index displacement perpendicular
-        # to the index tactile normal. Zero means both pad centers lie on the
-        # same tactile-normal axis.
-        v = p_thumb - p_index
-        v_parallel = float(np.dot(v, n_index)) * n_index
+        # ---------------------------------------------------------------
+        # 1) SOFT AXIS ALIGNMENT WITH DEAD-ZONE
+        # ---------------------------------------------------------------
+        v = p_other - p_ref
+
+        v_parallel = float(np.dot(v, n_ref)) * n_ref
         v_perp = v - v_parallel
-        axis_scale_m = 0.030  # normalization scale, not a desired gap
-        axis_res = v_perp / axis_scale_m
+        raw_axis_m = float(np.linalg.norm(v_perp))
 
+        # No penalty while the other fingertip lies inside a tolerance tube
+        # around the reference tactile-normal axis.
+        axis_res = soft_hinge(
+            raw_axis_m - float(axis_tolerance_m)
+        ) / self.axis_scale_m
+
+        # ---------------------------------------------------------------
         # 2) FACING NORMALS
-        # Ideal: n_thumb = -n_index -> dot = -1 -> residual = 0.
-        facing_res = 1.0 + float(np.dot(n_thumb, n_index))
+        # ---------------------------------------------------------------
+        # Ideal: n_other = -n_ref -> dot = -1 -> residual = 0.
+        facing_res = 1.0 + float(np.dot(n_other, n_ref))
 
-        # 3) TARGET GAP DRIVEN BY HUMAN CLOSURE
-        # Distance between the pad centers measured along the index normal.
-        gap_m = abs(float(np.dot(v, n_index)))
+        # ---------------------------------------------------------------
+        # 3) CLOSURE-DRIVEN TARGET GAP
+        # ---------------------------------------------------------------
+        raw_gap_m = abs(float(np.dot(v, n_ref)))
 
-        # Average human closure of thumb and index.
         c_pair = clamp(
-            0.5 * (float(thumb_closure) + float(index_closure)),
+            0.5 * (float(reference_closure) + float(other_closure)),
             0.0,
             1.0,
         )
 
-        # Desired separation between tactile pads:
-        #   fully open pair   -> about 100 mm
-        #   fully closed pair -> about 10 mm
-        #
-        # This is a generic geometry prior, not an object-size estimate.
         gap_open_m = 0.100
         gap_closed_m = 0.010
 
@@ -558,14 +619,73 @@ class LeapRetargeter:
             + gap_closed_m * c_pair
         )
 
-        # Signed normalized error:
-        #   > 0 : pads are farther apart than desired
-        #   < 0 : pads are closer than desired
-        #   = 0 : desired gap reached
         gap_scale_m = 0.050
-        gap_res = (gap_m - target_gap_m) / gap_scale_m
+        gap_res = (raw_gap_m - target_gap_m) / gap_scale_m
 
-        return axis_res, facing_res, gap_res
+        return axis_res, facing_res, gap_res, raw_axis_m, raw_gap_m
+
+
+    def index_middle_spread_residual(
+        self,
+        q: np.ndarray,
+    ):
+        """
+        Soft anti-collapse residual for index and middle fingertip centers.
+
+        Zero while their Euclidean separation is above the configured minimum.
+        """
+        p_index, _ = self.fingertip_position_and_normal(
+            q, self.fingers["index"]
+        )
+        p_middle, _ = self.fingertip_position_and_normal(
+            q, self.fingers["middle"]
+        )
+
+        distance_m = float(np.linalg.norm(p_index - p_middle))
+
+        spread_res = soft_hinge(
+            self.index_middle_min_spread_m - distance_m
+        ) / self.index_middle_spread_scale_m
+
+        return spread_res, distance_m
+
+    def index_middle_order_residual(
+        self,
+        q: np.ndarray,
+    ):
+        """
+        Preserve index-middle lateral ordering in the palm frame.
+
+        The neutral pose determines which finger lies on which lateral side.
+        The residual is zero while the signed lateral separation stays above
+        a configurable margin. It grows only when the fingers approach crossing
+        or actually swap order.
+        """
+        pin.forwardKinematics(self.model, self.data, q)
+        pin.updateFramePlacements(self.model, self.data)
+
+        palm_pose = self.data.oMf[self.palm_frame_id]
+
+        p_index = self.data.oMf[
+            self.model.getFrameId(self.fingers["index"].frame_name)
+        ].translation
+        p_middle = self.data.oMf[
+            self.model.getFrameId(self.fingers["middle"].frame_name)
+        ].translation
+
+        delta_world = p_middle - p_index
+        delta_palm = palm_pose.rotation.T @ delta_world
+
+        signed_sep_m = (
+            self.index_middle_order_sign
+            * float(np.dot(delta_palm, self.index_middle_lateral_axis_palm))
+        )
+
+        order_res = soft_hinge(
+            self.index_middle_order_margin_m - signed_sep_m
+        ) / self.index_middle_order_scale_m
+
+        return order_res, signed_sep_m
 
     # -----------------------------------------------------------------------
     # Joint-limit safety
@@ -648,38 +768,75 @@ class LeapRetargeter:
                 * self.tactile_cone_residual(q, cfg)
             )
         # ---------------------------------------------------------------
-        # SECONDARY: thumb-index tactile pinch geometry
+        # SECONDARY: tri-digit tactile grasp geometry
         # ---------------------------------------------------------------
         thumb_sample = samples.get("thumb")
         index_sample = samples.get("index")
+        middle_sample = samples.get("middle")
 
         if thumb_sample is not None and index_sample is not None:
             g_thumb = self.tactile_activation(thumb_sample.closure)
             g_index = self.tactile_activation(index_sample.closure)
-            g_pair = math.sqrt(g_thumb * g_index)
+            g_TI = math.sqrt(g_thumb * g_index)
 
-            axis_res, facing_res, gap_res = self.thumb_index_pinch_residuals(
+            axis_TI, face_TI, gap_TI, _, _ = self.finger_pair_grasp_residuals(
                 q,
-                thumb_sample.closure,
-                index_sample.closure,
+                reference_name="index",
+                other_name="thumb",
+                reference_closure=index_sample.closure,
+                other_closure=thumb_sample.closure,
+                axis_tolerance_m=self.axis_tolerance_TI_m,
             )
 
-            residuals.extend(
-                (g_pair * self.w_axis_alignment * axis_res).tolist()
+            residuals.append(g_TI * self.w_axis_TI * axis_TI)
+            residuals.append(g_TI * self.w_face_TI * face_TI)
+            residuals.append(g_TI * self.w_gap_TI * gap_TI)
+
+        if thumb_sample is not None and middle_sample is not None:
+            g_thumb = self.tactile_activation(thumb_sample.closure)
+            g_middle = self.tactile_activation(middle_sample.closure)
+            g_TM = math.sqrt(g_thumb * g_middle)
+
+            axis_TM, face_TM, gap_TM, _, _ = self.finger_pair_grasp_residuals(
+                q,
+                reference_name="middle",
+                other_name="thumb",
+                reference_closure=middle_sample.closure,
+                other_closure=thumb_sample.closure,
+                axis_tolerance_m=self.axis_tolerance_TM_m,
+            )
+
+            residuals.append(g_TM * self.w_axis_TM * axis_TM)
+            residuals.append(g_TM * self.w_face_TM * face_TM)
+            residuals.append(g_TM * self.w_gap_TM * gap_TM)
+
+        if index_sample is not None and middle_sample is not None:
+            g_index = self.tactile_activation(index_sample.closure)
+            g_middle = self.tactile_activation(middle_sample.closure)
+            g_IM = math.sqrt(g_index * g_middle)
+
+            spread_res, _ = self.index_middle_spread_residual(q)
+            order_res, _ = self.index_middle_order_residual(q)
+
+            residuals.append(
+                g_IM
+                * self.w_index_middle_spread
+                * spread_res
             )
             residuals.append(
-                g_pair * self.w_facing_normals * facing_res
-            )
-            residuals.append(
-                g_pair * self.w_gap * gap_res
+                g_IM
+                * self.w_index_middle_order
+                * order_res
             )
 
         # ---------------------------------------------------------------
-        # SECONDARY: neutral lateral posture for unobserved DoFs
+        # SECONDARY: adaptive neutral posture for unobserved lateral DoFs
         # ---------------------------------------------------------------
         # WEART does not provide index/middle adduction in this setup.
-        # Keep LEAP joints 0 and 4 near neutral so the tactile term cannot
-        # move the fingers sideways when closure is small or zero.
+        #
+        # Open fingers: keep q0/q4 near neutral.
+        # Closing fingers: reduce the neutral penalty so tactile/contact-ready
+        # objectives can exploit these robot-specific DoFs.
         index_lat_idx = self.q_index("0")
         middle_lat_idx = self.q_index("4")
 
@@ -690,13 +847,34 @@ class LeapRetargeter:
             self.upper[middle_lat_idx] - self.lower[middle_lat_idx], 1e-6
         )
 
+        index_sample = samples.get("index")
+        middle_sample = samples.get("middle")
+
+        g_index_lat = (
+            self.tactile_activation(index_sample.closure)
+            if index_sample is not None else 0.0
+        )
+        g_middle_lat = (
+            self.tactile_activation(middle_sample.closure)
+            if middle_sample is not None else 0.0
+        )
+
+        w_index_lat = (
+            self.w_lateral_open * (1.0 - g_index_lat)
+            + self.w_lateral_grasp * g_index_lat
+        )
+        w_middle_lat = (
+            self.w_lateral_open * (1.0 - g_middle_lat)
+            + self.w_lateral_grasp * g_middle_lat
+        )
+
         residuals.append(
-            self.w_lateral
+            w_index_lat
             * (q[index_lat_idx] - self.index_lateral_neutral)
             / index_lat_scale
         )
         residuals.append(
-            self.w_lateral
+            w_middle_lat
             * (q[middle_lat_idx] - self.middle_lateral_neutral)
             / middle_lat_scale
         )
@@ -787,27 +965,89 @@ class LeapRetargeter:
         index_sample = samples["index"]
 
         # ---------------------------------------------------------------
-        # Pair gating
+        # Tri-digit grasp diagnostics
         # ---------------------------------------------------------------
+        thumb_sample = samples["thumb"]
+        index_sample = samples["index"]
+        middle_sample = samples["middle"]
+
         g_thumb = self.tactile_activation(thumb_sample.closure)
         g_index = self.tactile_activation(index_sample.closure)
+        g_middle = self.tactile_activation(middle_sample.closure)
 
-        g_pair = math.sqrt(g_thumb * g_index)
+        g_TI = math.sqrt(g_thumb * g_index)
+        g_TM = math.sqrt(g_thumb * g_middle)
+        g_IM = math.sqrt(g_index * g_middle)
 
-        # Weighted pinch-geometry residual magnitudes used by the solver.
-        axis_res, facing_res, gap_res = self.thumb_index_pinch_residuals(
-            q_solution,
-            thumb_sample.closure,
-            index_sample.closure,
+        axis_TI, face_TI, gap_TI, raw_axis_TI_m, raw_gap_TI_m = (
+            self.finger_pair_grasp_residuals(
+                q_solution,
+                reference_name="index",
+                other_name="thumb",
+                reference_closure=index_sample.closure,
+                other_closure=thumb_sample.closure,
+                axis_tolerance_m=self.axis_tolerance_TI_m,
+            )
         )
-        diagnostics["axis_cost"] = (
-            g_pair * self.w_axis_alignment * float(np.linalg.norm(axis_res))
+
+        axis_TM, face_TM, gap_TM, raw_axis_TM_m, raw_gap_TM_m = (
+            self.finger_pair_grasp_residuals(
+                q_solution,
+                reference_name="middle",
+                other_name="thumb",
+                reference_closure=middle_sample.closure,
+                other_closure=thumb_sample.closure,
+                axis_tolerance_m=self.axis_tolerance_TM_m,
+            )
         )
-        diagnostics["facing_cost"] = (
-            g_pair * self.w_facing_normals * abs(float(facing_res))
+
+        spread_res, spread_m = self.index_middle_spread_residual(q_solution)
+        order_res, signed_order_sep_m = self.index_middle_order_residual(q_solution)
+
+        # Raw geometry.
+        diagnostics["axis_TI_mm"] = 1000.0 * raw_axis_TI_m
+        diagnostics["gap_TI_mm"] = 1000.0 * raw_gap_TI_m
+        diagnostics["axis_TM_mm"] = 1000.0 * raw_axis_TM_m
+        diagnostics["gap_TM_mm"] = 1000.0 * raw_gap_TM_m
+        diagnostics["spread_IM_mm"] = 1000.0 * spread_m
+        diagnostics["order_IM_signed_mm"] = 1000.0 * signed_order_sep_m
+
+        # Facing angles in degrees.
+        _, n_thumb = self.fingertip_position_and_normal(
+            q_solution, self.fingers["thumb"]
         )
-        diagnostics["gap_cost"] = (
-            g_pair * self.w_gap * abs(float(gap_res))
+        _, n_index = self.fingertip_position_and_normal(
+            q_solution, self.fingers["index"]
+        )
+        _, n_middle = self.fingertip_position_and_normal(
+            q_solution, self.fingers["middle"]
+        )
+
+        diagnostics["facing_TI_deg"] = math.degrees(
+            math.acos(
+                clamp(float(np.dot(n_thumb, -n_index)), -1.0, 1.0)
+            )
+        )
+        diagnostics["facing_TM_deg"] = math.degrees(
+            math.acos(
+                clamp(float(np.dot(n_thumb, -n_middle)), -1.0, 1.0)
+            )
+        )
+
+        # Weighted residual magnitudes.
+        diagnostics["axis_TI_cost"] = g_TI * self.w_axis_TI * abs(float(axis_TI))
+        diagnostics["face_TI_cost"] = g_TI * self.w_face_TI * abs(float(face_TI))
+        diagnostics["gap_TI_cost"] = g_TI * self.w_gap_TI * abs(float(gap_TI))
+
+        diagnostics["axis_TM_cost"] = g_TM * self.w_axis_TM * abs(float(axis_TM))
+        diagnostics["face_TM_cost"] = g_TM * self.w_face_TM * abs(float(face_TM))
+        diagnostics["gap_TM_cost"] = g_TM * self.w_gap_TM * abs(float(gap_TM))
+
+        diagnostics["spread_IM_cost"] = (
+            g_IM * self.w_index_middle_spread * abs(float(spread_res))
+        )
+        diagnostics["order_IM_cost"] = (
+            g_IM * self.w_index_middle_order * abs(float(order_res))
         )
 
         for finger_name in ("thumb", "index", "middle"):
@@ -846,6 +1086,25 @@ class LeapRetargeter:
                 / add_scale
             )
         )
+        # Diagnostics for adaptive lateral freedom.
+        index_lat_idx = self.q_index("0")
+        middle_lat_idx = self.q_index("4")
+
+        g_index_lat = self.tactile_activation(samples["index"].closure)
+        g_middle_lat = self.tactile_activation(samples["middle"].closure)
+
+        diagnostics["index_lateral_q"] = float(q_solution[index_lat_idx])
+        diagnostics["middle_lateral_q"] = float(q_solution[middle_lat_idx])
+
+        diagnostics["index_lateral_weight"] = (
+            self.w_lateral_open * (1.0 - g_index_lat)
+            + self.w_lateral_grasp * g_index_lat
+        )
+        diagnostics["middle_lateral_weight"] = (
+            self.w_lateral_open * (1.0 - g_middle_lat)
+            + self.w_lateral_grasp * g_middle_lat
+        )
+
         return q_solution, diagnostics
 
 
@@ -1251,21 +1510,38 @@ class WeartLeapRetargetingNode(Node):
                         f"middle: c={diag['middle_closure_robot']:.2f}, "
                         f"tact={diag['middle_tactile_angle_deg']:.1f}deg, "
                         f"gate={diag['middle_tactile_activation']:.2f}",
-                        f"thumb-index: axis={diag['axis_err_mm']:.1f} mm | "
-                        f"facing={diag['facing_err_deg']:.1f} deg | "
-                        f"gap={diag['gap_mm']:.1f} mm",
+                        f"T-I: axis={diag['axis_TI_mm']:.1f} mm, "
+                        f"face={diag['facing_TI_deg']:.1f} deg, "
+                        f"gap={diag['gap_TI_mm']:.1f} mm | "
+                        f"T-M: axis={diag['axis_TM_mm']:.1f} mm, "
+                        f"face={diag['facing_TM_deg']:.1f} deg, "
+                        f"gap={diag['gap_TM_mm']:.1f} mm | "
+                        f"I-M spread={diag['spread_IM_mm']:.1f} mm, "
+                        f"order={diag['order_IM_signed_mm']:.1f} mm",
                     ]
                 )
             )
             self.get_logger().info(
                  "COSTS | "
-                 f"axis={diag['axis_cost']:.3f} | "
-                 f"facing={diag['facing_cost']:.3f} | "
-                 f"gap={diag['gap_cost']:.3f} | "
+                 f"TI[a={diag['axis_TI_cost']:.3f}, "
+                 f"f={diag['face_TI_cost']:.3f}, "
+                 f"g={diag['gap_TI_cost']:.3f}] | "
+                 f"TM[a={diag['axis_TM_cost']:.3f}, "
+                 f"f={diag['face_TM_cost']:.3f}, "
+                 f"g={diag['gap_TM_cost']:.3f}] | "
+                 f"IMspread={diag['spread_IM_cost']:.3f} | "
+                 f"IMorder={diag['order_IM_cost']:.3f} | "
                  f"cl_thumb={diag['thumb_closure_cost']:.3f} | "
                  f"cl_index={diag['index_closure_cost']:.3f} | "
                  f"add_thumb={diag['thumb_adduction_cost']:.3f}"
              )
+            self.get_logger().info(
+                "LATERAL | "
+                f"q0_index={diag['index_lateral_q']:.3f} rad, "
+                f"w0={diag['index_lateral_weight']:.2f} | "
+                f"q4_middle={diag['middle_lateral_q']:.3f} rad, "
+                f"w4={diag['middle_lateral_weight']:.2f}"
+            )
 
 
 def main(args=None):
