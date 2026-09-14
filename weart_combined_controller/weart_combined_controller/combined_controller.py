@@ -1,5 +1,30 @@
 #!/usr/bin/env python3
-"""Publish WEART finger data and forward GelSight forces through one client."""
+"""Publish WEART finger data and forward tactile forces through one client.
+
+This node is the sole owner of the WEART middleware connection. Two things
+are independently configurable through the YAML config file:
+
+  tactile_sensor: "gelsight" | "xhand"
+      Where estimated per-finger contact force comes from, to be mapped onto
+      the WEART haptic thimbles (force feedback into the glove):
+        - "gelsight": per-finger geometry_msgs/Vector3 topics carrying a raw
+          force vector (as produced by a GelSight force estimator).
+        - "xhand": a single std_msgs/Float64MultiArray topic
+          (default /xhand/tactile_normalized, published by
+          teleoperation/weart_xhand_direct_retargeter.py) already normalized
+          to [0, 1], ordered [thumb, index, middle]. This folds in the logic
+          from teleoperation/xhand_tactile_to_weart_haptics.py so that only
+          one process ever connects to the WEART middleware.
+
+  hand_control: "leap_hand" | "xhand"
+      Which downstream hand-control node consumes the /weart/{thumb,index,
+      middle}/raw closure/adduction data this node always publishes (either
+      weart_leap_retargeter_adaptive_lat.py or
+      weart_xhand_direct_retargeter.py). Both retargeters read the exact same
+      raw topics, so this does not change what gets published here; it is
+      recorded and logged for clarity/validation, and to make the intended
+      pairing with tactile_sensor explicit in one place.
+"""
 
 import logging
 import threading
@@ -8,7 +33,7 @@ import time
 import rclpy
 from geometry_msgs.msg import Vector3
 from rclpy.node import Node
-from std_msgs.msg import String
+from std_msgs.msg import Float64MultiArray, String
 from weartsdk import (
     DeviceStatusListener,
     MiddlewareStatusListener,
@@ -29,6 +54,10 @@ from weartsdk import (
 HAND = WeArtCommon.HandSide.Right
 POLL_SLEEP_S = 0.001
 DIAGNOSTIC_PERIOD_S = 1.0
+GELSIGHT_FORCE_TIMEOUT_S = 1.0
+
+TACTILE_SENSORS = ("gelsight", "xhand")
+HAND_CONTROLS = ("leap_hand", "xhand")
 
 FINGERS = {
     "thumb": {
@@ -57,30 +86,40 @@ class CombinedController(Node):
         self.declare_parameters(
             namespace="",
             parameters=[
+                ("tactile_sensor", "gelsight"),
+                ("hand_control", "leap_hand"),
                 ("thumb_force_topic", "/gelsight/thumb/force"),
                 ("index_force_topic", "/gelsight/index/force"),
+                ("middle_force_topic", "/gelsight/middle/force"),
+                ("force_full_scale_z", 2),
+                ("xhand_tactile_topic", "/xhand/tactile_normalized"),
+                ("xhand_gain", 1.0),
+                ("xhand_deadband", 0.02),
+                ("xhand_smoothing_alpha", 0.35),
+                ("xhand_input_timeout_s", 0.5),
                 ("weart_ip", WeArtCommon.DEFAULT_IP_ADDRESS),
                 ("weart_port", WeArtCommon.DEFAULT_TCP_PORT),
                 ("hand_side", "Right"),
-                ("force_full_scale_z", 2),
                 ("force_log_period_s", 1.0),
             ],
         )
-        self.force_topics = {
-            "thumb": str(self.get_parameter("thumb_force_topic").value),
-            "index": str(self.get_parameter("index_force_topic").value),
-        }
+
+        self.tactile_sensor = str(self.get_parameter("tactile_sensor").value).strip().lower()
+        if self.tactile_sensor not in TACTILE_SENSORS:
+            raise ValueError(
+                f"tactile_sensor must be one of {TACTILE_SENSORS}, got {self.tactile_sensor!r}"
+            )
+
+        self.hand_control = str(self.get_parameter("hand_control").value).strip().lower()
+        if self.hand_control not in HAND_CONTROLS:
+            raise ValueError(
+                f"hand_control must be one of {HAND_CONTROLS}, got {self.hand_control!r}"
+            )
+
         self.weart_ip = str(self.get_parameter("weart_ip").value)
         self.weart_port = int(self.get_parameter("weart_port").value)
         self.hand_side = str(self.get_parameter("hand_side").value)
-        self.force_full_scale_z = float(
-            self.get_parameter("force_full_scale_z").value
-        )
-        if self.force_full_scale_z <= 0.0:
-            raise ValueError("force_full_scale_z must be positive")
-        self.force_log_period_s = float(
-            self.get_parameter("force_log_period_s").value
-        )
+        self.force_log_period_s = float(self.get_parameter("force_log_period_s").value)
         if self.force_log_period_s < 0.0:
             raise ValueError("force_log_period_s cannot be negative")
 
@@ -88,27 +127,59 @@ class CombinedController(Node):
             name: self.create_publisher(String, config["topic"], 20)
             for name, config in FINGERS.items()
         }
-        self._force_subscriptions = [
-            self.create_subscription(
-                Vector3,
-                topic,
-                lambda message, finger_name=finger_name: self._on_force_vector(
-                    finger_name, message
-                ),
-                10,
-            )
-            for finger_name, topic in self.force_topics.items()
-        ]
-        self._force_watchdog = self.create_timer(0.1, self._watchdog)
 
+        # State shared by both tactile-sensor backends, always keyed by all
+        # three fingers so the watchdog and haptic effects behave the same
+        # regardless of which backend is active.
         self._weart_lock = threading.RLock()
         self._client = None
         self._effects = {}
         self._haptics = {}
-        self._effect_active = {finger_name: False for finger_name in self.force_topics}
-        self._last_force_update = {finger_name: 0.0 for finger_name in self.force_topics}
-        self._last_force_log = {finger_name: 0.0 for finger_name in self.force_topics}
+        self._effect_active = {finger_name: False for finger_name in FINGERS}
+        self._last_force_update = {finger_name: 0.0 for finger_name in FINGERS}
+        self._last_force_log = {finger_name: 0.0 for finger_name in FINGERS}
         self._raw_started = False
+
+        self._tactile_subscriptions = []
+        if self.tactile_sensor == "gelsight":
+            self._force_timeout_s = GELSIGHT_FORCE_TIMEOUT_S
+            self.force_topics = {
+                "thumb": str(self.get_parameter("thumb_force_topic").value),
+                "index": str(self.get_parameter("index_force_topic").value),
+                "middle": str(self.get_parameter("middle_force_topic").value),
+            }
+            self.force_full_scale_z = float(self.get_parameter("force_full_scale_z").value)
+            if self.force_full_scale_z <= 0.0:
+                raise ValueError("force_full_scale_z must be positive")
+            self._tactile_subscriptions = [
+                self.create_subscription(
+                    Vector3,
+                    topic,
+                    lambda message, finger_name=finger_name: self._on_gelsight_force(
+                        finger_name, message
+                    ),
+                    10,
+                )
+                for finger_name, topic in self.force_topics.items()
+            ]
+        else:  # xhand
+            self.xhand_tactile_topic = str(self.get_parameter("xhand_tactile_topic").value)
+            self.xhand_gain = float(self.get_parameter("xhand_gain").value)
+            self.xhand_deadband = float(self.get_parameter("xhand_deadband").value)
+            self.xhand_smoothing_alpha = float(self.get_parameter("xhand_smoothing_alpha").value)
+            self._force_timeout_s = float(self.get_parameter("xhand_input_timeout_s").value)
+            self._xhand_smoothed = {finger_name: 0.0 for finger_name in FINGERS}
+            self._xhand_last_log = 0.0
+            self._tactile_subscriptions = [
+                self.create_subscription(
+                    Float64MultiArray,
+                    self.xhand_tactile_topic,
+                    self._on_xhand_tactile,
+                    20,
+                )
+            ]
+
+        self._force_watchdog = self.create_timer(0.1, self._watchdog)
 
         self._middleware_listener = MiddlewareStatusListener()
         self._device_listener = DeviceStatusListener()
@@ -124,6 +195,9 @@ class CombinedController(Node):
         the two behave identically; only the haptic-force setup is specific to
         this node.
         """
+        print(f"Tactile sensor source: {self.tactile_sensor}")
+        print(f"Hand control target: {self.hand_control}")
+
         self._client = WeArtClient(
             self.weart_ip, self.weart_port, log_level=logging.INFO
         )
@@ -231,9 +305,16 @@ class CombinedController(Node):
             "il relativo timestamp RAW."
         )
         print("Premi CTRL+C per terminare.\n")
+
+        if self.tactile_sensor == "gelsight":
+            tactile_source_desc = ", ".join(self.force_topics.values())
+        else:
+            tactile_source_desc = self.xhand_tactile_topic
+
         self.get_logger().info(
-            "Ready: publishing /weart/{thumb,index,middle}/raw; haptic inputs: %s"
-            % ", ".join(self.force_topics.values())
+            "Ready: publishing /weart/{thumb,index,middle}/raw; "
+            f"hand_control={self.hand_control}; tactile_sensor={self.tactile_sensor}; "
+            f"haptic input: {tactile_source_desc}"
         )
 
     def _configure_haptics(self):
@@ -246,7 +327,7 @@ class CombinedController(Node):
             velocity=0.0,
             volume=0.0,
         )
-        for finger_name in self.force_topics:
+        for finger_name in FINGERS:
             haptic = WeArtHapticObject(self._client)
             haptic.handSideFlag = self._parse_hand_side(self.hand_side)
             haptic.actuationPointFlag = FINGERS[finger_name]["point"]
@@ -330,7 +411,7 @@ class CombinedController(Node):
 
             time.sleep(POLL_SLEEP_S)
 
-    def _on_force_vector(self, finger_name, message):
+    def _on_gelsight_force(self, finger_name, message):
         now = time.monotonic()
         self._last_force_update[finger_name] = now
         # GelSight publishes compression as a negative z force. Values around
@@ -348,6 +429,49 @@ class CombinedController(Node):
             self._stop_effect(finger_name)
         else:
             self._send_force(finger_name, force_value)
+
+    def _on_xhand_tactile(self, message):
+        """Forward normalized XHAND tactile values to WEART haptic thimbles.
+
+        Folded in from teleoperation/xhand_tactile_to_weart_haptics.py: the
+        publisher (teleoperation/weart_xhand_direct_retargeter.py) already
+        normalizes each value to [0, 1] and orders them [thumb, index,
+        middle], so this only applies gain/smoothing/deadband before driving
+        the same haptic effects the gelsight backend uses.
+        """
+        values = list(message.data)
+        if len(values) < len(FINGERS):
+            self.get_logger().warning(
+                f"Expected at least {len(FINGERS)} values on {self.xhand_tactile_topic} "
+                f"(thumb, index, middle), got {len(values)}",
+                throttle_duration_sec=1.0,
+            )
+            return
+
+        now = time.monotonic()
+        sent = {}
+        for finger_name, raw_value in zip(FINGERS, values):
+            self._last_force_update[finger_name] = now
+            target = max(0.0, min(1.0, float(raw_value) * self.xhand_gain))
+            previous = self._xhand_smoothed[finger_name]
+            value = (
+                self.xhand_smoothing_alpha * target
+                + (1.0 - self.xhand_smoothing_alpha) * previous
+            )
+            value = max(0.0, min(1.0, value))
+            self._xhand_smoothed[finger_name] = value
+            sent[finger_name] = value
+            if value <= self.xhand_deadband:
+                self._stop_effect(finger_name)
+            else:
+                self._send_force(finger_name, value)
+
+        if self.force_log_period_s > 0.0 and now - self._xhand_last_log >= self.force_log_period_s:
+            self._xhand_last_log = now
+            self.get_logger().info(
+                f"XHAND tactile ({self.xhand_tactile_topic}) -> WEART force: "
+                + " | ".join(f"{name}={value:.2f}" for name, value in sent.items())
+            )
 
     def _send_force(self, finger_name, force_value):
         haptic = self._haptics.get(finger_name)
@@ -392,7 +516,7 @@ class CombinedController(Node):
 
     def _watchdog(self):
         for finger_name, last_update in self._last_force_update.items():
-            if last_update and time.monotonic() - last_update > 1.0:
+            if last_update and time.monotonic() - last_update > self._force_timeout_s:
                 self._stop_effect(finger_name)
 
     def _on_middleware_status(self, status):
@@ -412,7 +536,7 @@ class CombinedController(Node):
 
     def shutdown(self):
         self._force_watchdog.cancel()
-        for finger_name in self.force_topics:
+        for finger_name in FINGERS:
             self._stop_effect(finger_name)
         if not self._client:
             return

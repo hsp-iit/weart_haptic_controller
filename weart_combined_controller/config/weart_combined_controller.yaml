@@ -1,36 +1,80 @@
 # Configuration for the weart_combined_controller node.
 #
-# fingers:
-#   List of fingers to forward estimated contact forces for, on top of the
-#   thumb/index/middle raw tracking data that is always published. Each
-#   entry must be one of: thumb, index, middle (the fingers the WEART
-#   TouchDIVER provides force actuation for). At least one entry is
-#   required; entries not listed here are not driven by estimated forces.
+# This node is the sole owner of the WEART middleware connection. It always
+# publishes raw thumb/index/middle closure/adduction tracking data on
+# /weart/{thumb,index,middle}/raw, and always forwards estimated per-finger
+# contact force back into the WEART haptic thimbles (force feedback). Two
+# things are independently configurable:
 #
-# <finger>.force_topic:
-#   For each finger listed above, the name of the topic (geometry_msgs/Vector3)
-#   publishing that finger's estimated contact force, to be mapped onto the
-#   matching WEART finger haptic sensor.
+# tactile_sensor: "gelsight" | "xhand"
+#   Where the estimated contact force used for haptic feedback comes from.
+#     - "gelsight": three geometry_msgs/Vector3 topics (one per finger,
+#       <finger>.force_topic below), carrying a raw force vector. The z
+#       component is used, divided by force_full_scale_z and clamped to
+#       [0, 1].
+#     - "xhand": a single std_msgs/Float64MultiArray topic
+#       (xhand_tactile_topic below), published by
+#       teleoperation/weart_xhand_direct_retargeter.py, already normalized to
+#       [0, 1] and ordered [thumb, index, middle]
+#       (see: ros2 topic echo /xhand/tactile_normalized). This is the same
+#       logic previously in teleoperation/xhand_tactile_to_weart_haptics.py,
+#       folded in here so only one process connects to WEART.
 #
-# force_full_scale_z:
+# hand_control: "leap_hand" | "xhand"
+#   Which downstream node consumes the /weart/{thumb,index,middle}/raw data
+#   this node publishes: weart_leap_retargeter_adaptive_lat.py ("leap_hand")
+#   or weart_xhand_direct_retargeter.py ("xhand"). Both read the exact same
+#   raw topics, so this does not change what gets published; it documents
+#   the intended pairing and is validated/logged at startup.
+#
+# <finger>.force_topic (tactile_sensor: gelsight only):
+#   Name of the topic (geometry_msgs/Vector3) publishing that finger's
+#   estimated contact force.
+#
+# force_full_scale_z (tactile_sensor: gelsight only):
 #   Expected magnitude of the z-axis force (same units/sign convention as the
 #   estimated force topics above) at full contact. Incoming forces are
 #   divided by this value and clamped to [0, 1] before being sent to WEART,
 #   so it must be set to match the full-scale output of whatever force
 #   estimator publishes the topics above.
+#
+# xhand_tactile_topic (tactile_sensor: xhand only):
+#   std_msgs/Float64MultiArray topic with 3 already-normalized [0, 1] values
+#   ordered [thumb, index, middle].
+#
+# xhand_gain / xhand_deadband / xhand_smoothing_alpha / xhand_input_timeout_s
+# (tactile_sensor: xhand only):
+#   Gain applied before clamping to [0, 1], minimum value below which the
+#   haptic effect is stopped, exponential-smoothing factor (higher = less
+#   smoothing), and how long without a new message before forces are reset
+#   to zero.
 weart_combined_controller:
   ros__parameters:
     weart_ip: "127.0.0.1"
     weart_port: 13031
     hand_side: "Right"
-    force_full_scale_z: 2  
     force_log_period_s: 1.0
 
-    fingers:
-      - thumb
-      - index
-      - middle
+    # --- Choose the hand being driven and its tactile feedback source ---
+    hand_control: "xhand" # "leap_hand" | "xhand"
+    tactile_sensor: "xhand" # "gelsight" | "xhand"
 
-    thumb.force_topic: /gelsight/thumb/force
-    index.force_topic: /gelsight/index/force
-    middle.force_topic: /gelsight/middle/force
+    # --- tactile_sensor: gelsight ---
+    # force_full_scale_z: 2
+    # thumb.force_topic: /gelsight/thumb/force
+    # index.force_topic: /gelsight/index/force
+    # middle.force_topic: /gelsight/middle/force
+
+    # --- tactile_sensor: xhand ---
+    xhand_tactile_topic: /xhand/tactile_normalized
+    xhand_gain: 1.0
+    xhand_deadband: 0.02
+    xhand_smoothing_alpha: 0.35
+    xhand_input_timeout_s: 0.5
+
+# Example XHAND setup: set
+#   hand_control: "xhand"
+#   tactile_sensor: "xhand"
+# to drive the XHAND (via teleoperation/weart_xhand_direct_retargeter.py,
+# reading /weart/{thumb,index,middle}/raw published by this node) and feed
+# its own tactile sensors (/xhand/tactile_normalized) back into WEART.
