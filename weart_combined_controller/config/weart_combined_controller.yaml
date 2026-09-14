@@ -1,0 +1,36 @@
+# Configuration for the weart_combined_controller node.
+#
+# fingers:
+#   List of fingers to forward estimated contact forces for, on top of the
+#   thumb/index/middle raw tracking data that is always published. Each
+#   entry must be one of: thumb, index, middle (the fingers the WEART
+#   TouchDIVER provides force actuation for). At least one entry is
+#   required; entries not listed here are not driven by estimated forces.
+#
+# <finger>.force_topic:
+#   For each finger listed above, the name of the topic (geometry_msgs/Vector3)
+#   publishing that finger's estimated contact force, to be mapped onto the
+#   matching WEART finger haptic sensor.
+#
+# force_full_scale_z:
+#   Expected magnitude of the z-axis force (same units/sign convention as the
+#   estimated force topics above) at full contact. Incoming forces are
+#   divided by this value and clamped to [0, 1] before being sent to WEART,
+#   so it must be set to match the full-scale output of whatever force
+#   estimator publishes the topics above.
+weart_combined_controller:
+  ros__parameters:
+    weart_ip: "127.0.0.1"
+    weart_port: 13031
+    hand_side: "Right"
+    force_full_scale_z: 2  
+    force_log_period_s: 1.0
+
+    fingers:
+      - thumb
+      - index
+      - middle
+
+    thumb.force_topic: /gelsight/thumb/force
+    index.force_topic: /gelsight/index/force
+    middle.force_topic: /gelsight/middle/force

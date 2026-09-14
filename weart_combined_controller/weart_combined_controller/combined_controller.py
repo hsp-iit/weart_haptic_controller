@@ -62,7 +62,7 @@ class CombinedController(Node):
                 ("weart_ip", WeArtCommon.DEFAULT_IP_ADDRESS),
                 ("weart_port", WeArtCommon.DEFAULT_TCP_PORT),
                 ("hand_side", "Right"),
-                ("force_full_scale_z", 0.25),
+                ("force_full_scale_z", 2),
                 ("force_log_period_s", 1.0),
             ],
         )
@@ -117,15 +117,21 @@ class CombinedController(Node):
         self._raw_objects = {}
 
     def start(self):
-        """Connect, calibrate and enable raw data exactly once for this process."""
+        """Connect, calibrate and enable raw data exactly once for this process.
+
+        The finger-tracking half of this method (everything through the raw-data
+        readiness check) mirrors teleoperation/weart_all_fingers_publisher.py so
+        the two behave identically; only the haptic-force setup is specific to
+        this node.
+        """
         self._client = WeArtClient(
             self.weart_ip, self.weart_port, log_level=logging.INFO
         )
+        self._middleware_listener.AddStatusCallback(self._on_middleware_status)
+        self._device_listener.AddStatusCallback(self._on_device_status)
         self._client.AddMessageListener(self._middleware_listener)
         self._client.AddMessageListener(self._device_listener)
         self._client.AddMessageListener(self._calibration)
-        self._middleware_listener.AddStatusCallback(self._on_middleware_status)
-        self._device_listener.AddStatusCallback(self._on_device_status)
 
         for finger_name, config in FINGERS.items():
             tracking = WeArtThimbleTrackingObject(HAND, config["point"])
@@ -137,35 +143,94 @@ class CombinedController(Node):
 
         self._configure_haptics()
 
-        self.get_logger().info("Connecting to WEART Middleware...")
+        print("Connessione al WEART Middleware...")
         self._client.Run()
+
         if not self._client.IsConnected():
-            raise RuntimeError(
-                f"Could not connect to WEART middleware at {self.weart_ip}:{self.weart_port}"
+            raise RuntimeError("Connessione TCP al WEART Middleware non riuscita.")
+
+        print("TCP collegato correttamente.")
+        print("Attendo 3 secondi per lo stato del Middleware...")
+
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            status = self._middleware_listener.LastStatus()
+            if status.timestamp != 0:
+                break
+            time.sleep(0.1)
+
+        status = self._middleware_listener.LastStatus()
+        if status.timestamp == 0:
+            print(
+                "\n[ATTENZIONE] Nessun MiddlewareStatusUpdate ricevuto."
+                "\nIl socket è comunque collegato: provo ad avviare il device."
+            )
+        else:
+            print(
+                f"\nUltimo stato Middleware: "
+                f"{status.status}, devices={len(status.connectedDevices)}"
             )
 
-        self._wait_for_initial_status()
-        self.get_logger().info("Starting WEART session...")
+        print("\nInvio client.Start()...")
         self._client.Start()
         time.sleep(2.0)
 
-        input(
-            "Wear the glove, keep your hand still in the calibration position, "
-            "then press Enter..."
+        status = self._middleware_listener.LastStatus()
+        print(
+            f"Stato dopo Start: "
+            f"{status.status}, code={status.statusCode}, "
+            f"error='{status.errorDesc}'"
         )
-        self.get_logger().info("Starting WEART calibration...")
-        self._client.StartCalibration()
-        deadline = time.monotonic() + 20.0
-        while not self._calibration.getResult():
-            if time.monotonic() > deadline:
-                raise RuntimeError("WEART calibration timed out after 20 seconds")
-            time.sleep(0.2)
-        self._client.StopCalibration()
 
-        self.get_logger().info("Starting RAW data for thumb, index and middle...")
+        input(
+            "\nIndossa il guanto, tieni la mano ferma nella posizione "
+            "di calibrazione e premi INVIO..."
+        )
+
+        print("Avvio calibrazione WEART...")
+        self._client.StartCalibration()
+
+        calib_deadline = time.time() + 20.0
+        while not self._calibration.getResult():
+            if time.time() > calib_deadline:
+                raise RuntimeError(
+                    "Timeout calibrazione WEART: nessun risultato dopo 20 secondi."
+                )
+            time.sleep(0.2)
+
+        self._client.StopCalibration()
+        print("Calibrazione WEART completata.")
+
+        print("\nAvvio dati RAW di pollice, indice e medio...")
         self._client.StartRawData()
         self._raw_started = True
-        self._wait_for_raw_samples()
+
+        waiting = set(FINGERS.keys())
+        raw_deadline = time.time() + 10.0
+
+        while waiting:
+            for finger_name in list(waiting):
+                sample = self._raw_objects[finger_name].GetLastSample()
+                if sample.timestamp != 0:
+                    print(f"Primo campione RAW ricevuto: {finger_name}")
+                    waiting.remove(finger_name)
+
+            if time.time() > raw_deadline:
+                raise RuntimeError(
+                    "Timeout: nessun campione RAW per: " + ", ".join(sorted(waiting))
+                )
+
+            time.sleep(0.01)
+
+        print("\nPubblicazione ROS 2 attiva:")
+        for finger_name, config in FINGERS.items():
+            print(f"  {finger_name:>6}: {config['topic']}")
+
+        print(
+            "\nOgni dito viene pubblicato solo quando cambia "
+            "il relativo timestamp RAW."
+        )
+        print("Premi CTRL+C per terminare.\n")
         self.get_logger().info(
             "Ready: publishing /weart/{thumb,index,middle}/raw; haptic inputs: %s"
             % ", ".join(self.force_topics.values())
@@ -188,81 +253,81 @@ class CombinedController(Node):
             self._haptics[finger_name] = haptic
             self._effects[finger_name] = TouchEffect(temperature, force, texture)
 
-    def _wait_for_initial_status(self):
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline:
-            if self._middleware_listener.LastStatus().timestamp != 0:
-                return
-            time.sleep(0.1)
-        self.get_logger().warning(
-            "No MiddlewareStatusUpdate received; continuing with the connected socket"
-        )
-
-    def _wait_for_raw_samples(self):
-        waiting = set(FINGERS)
-        deadline = time.monotonic() + 10.0
-        while waiting:
-            for finger_name in list(waiting):
-                if self._raw_objects[finger_name].GetLastSample().timestamp != 0:
-                    self.get_logger().info("First RAW sample: %s" % finger_name)
-                    waiting.remove(finger_name)
-            if time.monotonic() > deadline:
-                raise RuntimeError(
-                    "Timed out waiting for RAW samples: " + ", ".join(sorted(waiting))
-                )
-            time.sleep(0.01)
-
     def publish_raw_data(self):
-        """Preserve the original publisher's timestamp-driven String messages."""
+        """Match teleoperation/weart_all_fingers_publisher.py's publish loop exactly."""
         last_timestamp = {finger_name: None for finger_name in FINGERS}
-        sample_count = {finger_name: 0 for finger_name in FINGERS}
+        samples_since_diag = {finger_name: 0 for finger_name in FINGERS}
         latest_closure = {finger_name: 0.0 for finger_name in FINGERS}
         latest_tof = {finger_name: None for finger_name in FINGERS}
-        diagnostic_start = time.perf_counter()
+        diag_start = time.perf_counter()
 
         while rclpy.ok():
             for finger_name, config in FINGERS.items():
                 sample = self._raw_objects[finger_name].GetLastSample()
-                if sample.timestamp == 0 or sample.timestamp == last_timestamp[finger_name]:
+
+                if sample.timestamp == 0:
                     continue
+
+                if sample.timestamp == last_timestamp[finger_name]:
+                    continue
+
                 last_timestamp[finger_name] = sample.timestamp
 
                 tracking = self._tracking_objects[finger_name]
+
                 closure = float(tracking.GetClosure())
                 opening = 1.0 - closure
+
                 if config["has_abduction"]:
                     abduction = float(tracking.GetAbduction())
                     adduction = 1.0 - abduction
                 else:
-                    abduction, adduction = 0.0, 1.0
+                    abduction = 0.0
+                    adduction = 1.0
 
                 data = sample.data
-                acc, gyro, tof = data.accelerometer, data.gyroscope, data.timeOfFlight
-                message = String()
-                message.data = (
-                    f"ts={sample.timestamp} | closure={closure:.6f} | "
-                    f"opening={opening:.6f} | abduction={abduction:.6f} | "
+                acc = data.accelerometer
+                gyro = data.gyroscope
+                tof = data.timeOfFlight
+
+                line = (
+                    f"ts={sample.timestamp} | "
+                    f"closure={closure:.6f} | "
+                    f"opening={opening:.6f} | "
+                    f"abduction={abduction:.6f} | "
                     f"adduction={adduction:.6f} | "
                     f"ACC[g]=({acc.x:.6f}, {acc.y:.6f}, {acc.z:.6f}) | "
                     f"GYRO[deg/s]=({gyro.x:.6f}, {gyro.y:.6f}, {gyro.z:.6f}) | "
                     f"ToF[mm]={tof.distance}"
                 )
+
+                message = String()
+                message.data = line
                 self.finger_publishers[finger_name].publish(message)
-                sample_count[finger_name] += 1
+
+                samples_since_diag[finger_name] += 1
                 latest_closure[finger_name] = closure
                 latest_tof[finger_name] = tof.distance
 
             rclpy.spin_once(self, timeout_sec=0.0)
+
             now = time.perf_counter()
-            elapsed = now - diagnostic_start
+            elapsed = now - diag_start
+
             if elapsed >= DIAGNOSTIC_PERIOD_S:
-                self.get_logger().info(" | ".join(
-                    f"{name}: {sample_count[name] / elapsed:.1f} Hz "
-                    f"(closure={latest_closure[name]:.3f}, ToF={latest_tof[name]})"
-                    for name in FINGERS
-                ))
-                sample_count = {finger_name: 0 for finger_name in FINGERS}
-                diagnostic_start = now
+                parts = []
+                for finger_name in FINGERS:
+                    hz = samples_since_diag[finger_name] / elapsed
+                    parts.append(
+                        f"{finger_name}: {hz:.1f} Hz "
+                        f"(closure={latest_closure[finger_name]:.3f}, "
+                        f"ToF={latest_tof[finger_name]})"
+                    )
+                    samples_since_diag[finger_name] = 0
+
+                self.get_logger().info(" | ".join(parts))
+                diag_start = now
+
             time.sleep(POLL_SLEEP_S)
 
     def _on_force_vector(self, finger_name, message):
