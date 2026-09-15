@@ -402,7 +402,7 @@ class WeartXHandDirectRetargetingNode(Node):
         self.declare_parameter("kd", 0)
         self.declare_parameter("tor_max", 300)
         self.declare_parameter("control_mode", 3)
-        self.declare_parameter("closure_scale", 0.55)
+        self.declare_parameter("closure_scale", 0.9)
         self.declare_parameter("closure_exponent", 1.35)
         self.declare_parameter("low_pass_alpha", 0.25)
         self.declare_parameter("max_speed_rad_s", 1.5)
@@ -525,7 +525,7 @@ class WeartXHandDirectRetargetingNode(Node):
         middle_c = self.closure_scale * shaped_closure(middle.closure, self.closure_exponent)
 
         q[0] = thumb_c * UPPER[0]
-        q[1] = thumb_c * (1.0 - thumb.adduction) * 0.45
+        q[1] = thumb_c * (1.0 - thumb.adduction) * 0.85
         q[2] = thumb_c * UPPER[2]
 
         q[3] = 0.0
