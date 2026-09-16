@@ -86,7 +86,7 @@ JOINT_NAMES = (
 
 # Limits from robotera/xhand1/urdf/Xhand-urdf/xhand_right/urdf/xhand_right.urdf
 LOWER = np.array([0.0, -0.698, 0.0, -0.174, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-UPPER = np.array([1.832, 1.570, 1.570, 0.174, 1.919, 1.919, 1.919, 1.919, 1.919, 1.919, 1.919, 1.919])
+UPPER = np.array([1.570, 1.570, 1.570, 0.174, 1.919, 1.919, 1.919, 1.919, 1.919, 1.919, 1.919, 1.919])
 VELOCITY = np.array([8.63, 8.63, 14.38, 14.38, 8.63, 14.38, 8.63, 14.38, 8.63, 14.38, 8.63, 14.38])
 
 
@@ -143,6 +143,9 @@ class XHandDirectDriver:
         self.tor_max = int(tor_max)
         self.control_mode = int(control_mode)
         self.dev = None
+        self.tactile_offset: Dict[str, np.ndarray] = {
+            name: np.zeros(3, dtype=float) for name in ("thumb", "index", "middle")
+        }
 
     def connect(self) -> None:
         if not self.enabled:
@@ -168,6 +171,31 @@ class XHandDirectDriver:
             raise RuntimeError(f"Failed to open XHAND: {reply.error_message}")
 
         print(f"[XHAND] connected via {self.protocol}.", flush=True)
+        self.log_version_info()
+        try:
+            self.tare_tactile_sensors()
+        except Exception as exc:
+            print(f"[XHAND] initial tactile tare failed: {exc}", flush=True)
+
+    def log_version_info(self) -> None:
+        sdk_version = self.dev.get_sdk_version()
+        print(f"[XHAND] software SDK version: {sdk_version}", flush=True)
+
+        version_reply, hw_version = self.dev.read_version(self.hand_id, 0)
+        if version_reply.error_code == 0:
+            print(f"[XHAND] hardware version (joint 0): {hw_version}", flush=True)
+        else:
+            print(f"[XHAND] failed to read hardware version: {version_reply.error_message}", flush=True)
+
+        info_reply, info = self.dev.read_device_info(self.hand_id)
+        if info_reply.error_code == 0:
+            print(
+                f"[XHAND] device info: serial_number={info.serial_number[0:16]!r} "
+                f"hand_id={info.hand_id} ev_hand={info.ev_hand}",
+                flush=True,
+            )
+        else:
+            print(f"[XHAND] failed to read device info: {info_reply.error_message}", flush=True)
 
     def disconnect(self) -> None:
         if self.dev is not None:
@@ -196,7 +224,39 @@ class XHandDirectDriver:
         if reply.error_code != 0:
             raise RuntimeError(f"Failed to send XHAND command: {reply.error_message}")
 
-    def read_tactile_forces(self, force_update: bool = False) -> dict[str, np.ndarray]:
+    def tare_tactile_sensors(self) -> None:
+        """Capture the current raw fingertip forces as the new zero baseline.
+
+        The hand's firmware rejects the SDK's reset_sensor command
+        (CMD_CLREAR_PRESSURE / 0x12) on every finger board ("Unknow Cmd!"),
+        confirmed even on the latest fingertip firmware, so zeroing is done
+        entirely in software: we remember the current reading per finger and
+        subtract it from every future read_tactile_forces() call.
+        """
+        if not self.enabled:
+            return
+
+        num_samples = 5
+        samples = [self.read_raw_tactile_forces(force_update=True) for _ in range(num_samples)]
+        self.tactile_offset = {
+            name: np.mean([sample[name] for sample in samples], axis=0)
+            for name in samples[0]
+        }
+        print(
+            "[XHAND] tactile baseline tared (avg of "
+            f"{num_samples} samples): "
+            + " | ".join(f"{name}={np.linalg.norm(value):.2f}N" for name, value in self.tactile_offset.items()),
+            flush=True,
+        )
+
+        residual = self.read_tactile_forces(force_update=True)
+        print(
+            "[XHAND] tactile residual right after tare (should be ~0): "
+            + " | ".join(f"{name}={np.linalg.norm(value):.2f}N" for name, value in residual.items()),
+            flush=True,
+        )
+
+    def read_raw_tactile_forces(self, force_update: bool = False) -> dict[str, np.ndarray]:
         if not self.enabled:
             return {}
         if self.dev is None:
@@ -217,6 +277,13 @@ class XHandDirectDriver:
                 dtype=float,
             )
         return forces
+
+    def read_tactile_forces(self, force_update: bool = False) -> dict[str, np.ndarray]:
+        raw = self.read_raw_tactile_forces(force_update=force_update)
+        return {
+            name: value - self.tactile_offset.get(name, np.zeros(3, dtype=float))
+            for name, value in raw.items()
+        }
 
 
 class WeartHapticFeedback:
@@ -414,8 +481,8 @@ class WeartXHandDirectRetargetingNode(Node):
         self.declare_parameter("weart_port", 13031)
         self.declare_parameter("weart_hand_side", "Right")
         self.declare_parameter("tactile_rate_hz", 20.0)
-        self.declare_parameter("tactile_full_scale_n", 20.0)
-        self.declare_parameter("tactile_deadband_n", 0.2)
+        self.declare_parameter("tactile_full_scale_n", 8.0)
+        self.declare_parameter("tactile_deadband_n", 0.0)
         self.declare_parameter("haptic_smoothing_alpha", 0.25)
         self.declare_parameter("haptic_min_force", 0.02)
         self.declare_parameter("haptic_log_period_s", 1.0)
@@ -486,6 +553,14 @@ class WeartXHandDirectRetargetingNode(Node):
                 self.tactile_step,
             )
 
+        self.zero_tactile_requested = threading.Event()
+        self.zero_tactile_cooldown_s = 0.5
+        self.last_zero_tactile_time = -math.inf
+        self.keyboard_thread = None
+        self.keyboard_stop = threading.Event()
+        if self.driver.enabled:
+            self.start_keyboard_listener()
+
         self.get_logger().info("WEART -> XHAND direct retargeter started.")
         if self.driver.enabled:
             self.get_logger().warning("XHAND HARDWARE OUTPUT ENABLED.")
@@ -495,6 +570,36 @@ class WeartXHandDirectRetargetingNode(Node):
             self.get_logger().warning("WEART HAPTIC FEEDBACK ENABLED.")
         elif self.publish_xhand_tactile:
             self.get_logger().info("Publishing XHAND tactile values on /xhand/tactile_normalized.")
+
+    def start_keyboard_listener(self) -> None:
+        if not sys.stdin.isatty():
+            self.get_logger().info(
+                "stdin is not a TTY; Shift+X tactile-zero shortcut is disabled."
+            )
+            return
+
+        self.keyboard_thread = threading.Thread(
+            target=self.keyboard_listener_loop, daemon=True
+        )
+        self.keyboard_thread.start()
+        self.get_logger().info("Press Shift+X to zero the XHAND tactile sensors.")
+
+    def keyboard_listener_loop(self) -> None:
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        original_settings = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while not self.keyboard_stop.is_set():
+                char = sys.stdin.read(1)
+                if char == "X":
+                    self.zero_tactile_requested.set()
+        except Exception as exc:
+            self.get_logger().warning(f"Keyboard listener stopped: {exc}")
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, original_settings)
 
     def now_s(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
@@ -524,8 +629,12 @@ class WeartXHandDirectRetargetingNode(Node):
         index_c = self.closure_scale * shaped_closure(index.closure, self.closure_exponent)
         middle_c = self.closure_scale * shaped_closure(middle.closure, self.closure_exponent)
 
-        q[0] = thumb_c * UPPER[0]
-        q[1] = thumb_c * (1.0 - thumb.adduction) * 0.85
+        # right_hand_thumb_bend_joint (q[0]) is the thumb's ab/adduction axis
+        # on the real hand (0-105 deg), not flexion despite its URDF name.
+        # Drive it directly from the WEART adduction reading across its full
+        # range so the joint is actually exploited, independent of closure.
+        q[0] = (1.0 - thumb.adduction) * UPPER[0]
+        q[1] = thumb_c * UPPER[1]
         q[2] = thumb_c * UPPER[2]
 
         q[3] = 0.0
@@ -544,6 +653,17 @@ class WeartXHandDirectRetargetingNode(Node):
         return np.clip(q, LOWER, UPPER)
 
     def control_step(self) -> None:
+        if self.zero_tactile_requested.is_set():
+            self.zero_tactile_requested.clear()
+            now_s = self.now_s()
+            if now_s - self.last_zero_tactile_time >= self.zero_tactile_cooldown_s:
+                self.last_zero_tactile_time = now_s
+                try:
+                    self.driver.tare_tactile_sensors()
+                    self.get_logger().info("XHAND tactile sensors tared (Shift+X).")
+                except Exception as exc:
+                    self.get_logger().error(f"Failed to zero XHAND tactile sensors: {exc}")
+
         if not all(name in self.samples for name in ("thumb", "index", "middle")):
             self.wait_diag_counter += 1
             if self.wait_diag_counter % 60 == 0:
@@ -622,6 +742,7 @@ class WeartXHandDirectRetargetingNode(Node):
         self.haptic_pub.publish(msg)
 
     def destroy_node(self):
+        self.keyboard_stop.set()
         try:
             self.haptics.disconnect()
             self.driver.disconnect()
