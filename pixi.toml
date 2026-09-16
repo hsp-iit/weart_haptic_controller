@@ -13,3 +13,4 @@ scipy = ">=1.18.0,<2"
 
 [pypi-dependencies]
 weartsdk = ">=2.0.3, <3"
+vosk = ">=0.3.45, <0.4"
