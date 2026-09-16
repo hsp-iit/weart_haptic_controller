@@ -15,8 +15,8 @@ published targets.
 
 from __future__ import annotations
 
-import math
 import re
+import select
 import sys
 import threading
 import time
@@ -88,6 +88,7 @@ JOINT_NAMES = (
 LOWER = np.array([0.0, -0.698, 0.0, -0.174, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 UPPER = np.array([1.570, 1.570, 1.570, 0.174, 1.919, 1.919, 1.919, 1.919, 1.919, 1.919, 1.919, 1.919])
 VELOCITY = np.array([8.63, 8.63, 14.38, 14.38, 8.63, 14.38, 8.63, 14.38, 8.63, 14.38, 8.63, 14.38])
+TACTILE_SENSOR_IDS = tuple(range(0x11, 0x16))
 
 
 @dataclass
@@ -143,9 +144,6 @@ class XHandDirectDriver:
         self.tor_max = int(tor_max)
         self.control_mode = int(control_mode)
         self.dev = None
-        self.tactile_offset: Dict[str, np.ndarray] = {
-            name: np.zeros(3, dtype=float) for name in ("thumb", "index", "middle")
-        }
 
     def connect(self) -> None:
         if not self.enabled:
@@ -172,10 +170,6 @@ class XHandDirectDriver:
 
         print(f"[XHAND] connected via {self.protocol}.", flush=True)
         self.log_version_info()
-        try:
-            self.tare_tactile_sensors()
-        except Exception as exc:
-            print(f"[XHAND] initial tactile tare failed: {exc}", flush=True)
 
     def log_version_info(self) -> None:
         sdk_version = self.dev.get_sdk_version()
@@ -224,39 +218,25 @@ class XHandDirectDriver:
         if reply.error_code != 0:
             raise RuntimeError(f"Failed to send XHAND command: {reply.error_message}")
 
-    def tare_tactile_sensors(self) -> None:
-        """Capture the current raw fingertip forces as the new zero baseline.
-
-        The hand's firmware rejects the SDK's reset_sensor command
-        (CMD_CLREAR_PRESSURE / 0x12) on every finger board ("Unknow Cmd!"),
-        confirmed even on the latest fingertip firmware, so zeroing is done
-        entirely in software: we remember the current reading per finger and
-        subtract it from every future read_tactile_forces() call.
-        """
+    def reset_tactile_sensors_sdk(self) -> None:
         if not self.enabled:
             return
+        if self.dev is None:
+            raise RuntimeError("XHAND is not connected.")
 
-        num_samples = 5
-        samples = [self.read_raw_tactile_forces(force_update=True) for _ in range(num_samples)]
-        self.tactile_offset = {
-            name: np.mean([sample[name] for sample in samples], axis=0)
-            for name in samples[0]
-        }
-        print(
-            "[XHAND] tactile baseline tared (avg of "
-            f"{num_samples} samples): "
-            + " | ".join(f"{name}={np.linalg.norm(value):.2f}N" for name, value in self.tactile_offset.items()),
-            flush=True,
-        )
+        for sensor_id in TACTILE_SENSOR_IDS:
+            reply = self.dev.reset_sensor(self.hand_id, sensor_id)
+            if reply.error_code != 0:
+                raise RuntimeError(
+                    f"Failed to reset XHAND tactile sensor 0x{sensor_id:02x}: "
+                    f"{reply.error_message}"
+                )
+            print(
+                f"[XHAND] SDK reset_sensor OK: sensor_id=0x{sensor_id:02x}",
+                flush=True,
+            )
 
-        residual = self.read_tactile_forces(force_update=True)
-        print(
-            "[XHAND] tactile residual right after tare (should be ~0): "
-            + " | ".join(f"{name}={np.linalg.norm(value):.2f}N" for name, value in residual.items()),
-            flush=True,
-        )
-
-    def read_raw_tactile_forces(self, force_update: bool = False) -> dict[str, np.ndarray]:
+    def read_tactile_forces(self, force_update: bool = False) -> dict[str, np.ndarray]:
         if not self.enabled:
             return {}
         if self.dev is None:
@@ -277,13 +257,6 @@ class XHandDirectDriver:
                 dtype=float,
             )
         return forces
-
-    def read_tactile_forces(self, force_update: bool = False) -> dict[str, np.ndarray]:
-        raw = self.read_raw_tactile_forces(force_update=force_update)
-        return {
-            name: value - self.tactile_offset.get(name, np.zeros(3, dtype=float))
-            for name, value in raw.items()
-        }
 
 
 class WeartHapticFeedback:
@@ -486,6 +459,9 @@ class WeartXHandDirectRetargetingNode(Node):
         self.declare_parameter("haptic_smoothing_alpha", 0.25)
         self.declare_parameter("haptic_min_force", 0.02)
         self.declare_parameter("haptic_log_period_s", 1.0)
+        self.declare_parameter("enable_voice_tactile_reset", False)
+        self.declare_parameter("voice_tactile_reset_topic", "/speech/recognized")
+        self.declare_parameter("voice_tactile_reset_phrase", "azzera")
 
         self.closure_scale = float(self.get_parameter("closure_scale").value)
         self.closure_exponent = float(self.get_parameter("closure_exponent").value)
@@ -494,6 +470,10 @@ class WeartXHandDirectRetargetingNode(Node):
         self.mirror_middle = bool(self.get_parameter("mirror_middle_to_ring_little").value)
         self.max_sample_age_s = float(self.get_parameter("max_sample_age_s").value)
         self.publish_xhand_tactile = bool(self.get_parameter("publish_xhand_tactile").value)
+        self.enable_voice_tactile_reset = bool(self.get_parameter("enable_voice_tactile_reset").value)
+        self.voice_tactile_reset_phrase = str(
+            self.get_parameter("voice_tactile_reset_phrase").value
+        ).strip().lower()
 
         self.samples: Dict[str, WeartSample] = {}
         self.last_rx_time: Dict[str, float] = {}
@@ -536,6 +516,13 @@ class WeartXHandDirectRetargetingNode(Node):
                 lambda msg, finger_name=finger: self.weart_callback(finger_name, msg),
                 20,
             )
+        if self.enable_voice_tactile_reset:
+            voice_topic = str(self.get_parameter("voice_tactile_reset_topic").value)
+            self.create_subscription(String, voice_topic, self.voice_reset_callback, 20)
+            self.get_logger().info(
+                f"Voice tactile reset enabled: topic={voice_topic} "
+                f"phrase='{self.voice_tactile_reset_phrase}'"
+            )
 
         self.target_pub = self.create_publisher(Float64MultiArray, "/xhand/target_joint_positions", 20)
         self.haptic_pub = self.create_publisher(Float64MultiArray, "/xhand/tactile_normalized", 20)
@@ -553,11 +540,11 @@ class WeartXHandDirectRetargetingNode(Node):
                 self.tactile_step,
             )
 
-        self.zero_tactile_requested = threading.Event()
-        self.zero_tactile_cooldown_s = 0.5
-        self.last_zero_tactile_time = -math.inf
-        self.keyboard_thread = None
+        self.reset_tactile_requested = threading.Event()
+        self.reset_tactile_cooldown_s = 0.5
+        self.last_reset_tactile_time = -float("inf")
         self.keyboard_stop = threading.Event()
+        self.keyboard_thread = None
         if self.driver.enabled:
             self.start_keyboard_listener()
 
@@ -574,15 +561,16 @@ class WeartXHandDirectRetargetingNode(Node):
     def start_keyboard_listener(self) -> None:
         if not sys.stdin.isatty():
             self.get_logger().info(
-                "stdin is not a TTY; Shift+X tactile-zero shortcut is disabled."
+                "stdin is not a TTY; Shift+X tactile SDK reset shortcut is disabled."
             )
             return
 
         self.keyboard_thread = threading.Thread(
-            target=self.keyboard_listener_loop, daemon=True
+            target=self.keyboard_listener_loop,
+            daemon=True,
         )
         self.keyboard_thread.start()
-        self.get_logger().info("Press Shift+X to zero the XHAND tactile sensors.")
+        self.get_logger().info("Press Shift+X to reset XHAND tactile sensors via SDK.")
 
     def keyboard_listener_loop(self) -> None:
         import termios
@@ -593,9 +581,12 @@ class WeartXHandDirectRetargetingNode(Node):
         try:
             tty.setcbreak(fd)
             while not self.keyboard_stop.is_set():
+                ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if not ready:
+                    continue
                 char = sys.stdin.read(1)
                 if char == "X":
-                    self.zero_tactile_requested.set()
+                    self.reset_tactile_requested.set()
         except Exception as exc:
             self.get_logger().warning(f"Keyboard listener stopped: {exc}")
         finally:
@@ -614,6 +605,12 @@ class WeartXHandDirectRetargetingNode(Node):
                 f"First WEART sample for {finger_name}: "
                 f"closure={sample.closure:.3f}, adduction={sample.adduction:.3f}"
             )
+
+    def voice_reset_callback(self, msg: String) -> None:
+        text = msg.data.strip().lower()
+        if self.voice_tactile_reset_phrase and self.voice_tactile_reset_phrase in text:
+            self.reset_tactile_requested.set()
+            self.get_logger().info(f"Voice tactile reset requested: {msg.data!r}")
 
     def sample_is_fresh(self, finger_name: str) -> bool:
         return finger_name in self.last_rx_time and (self.now_s() - self.last_rx_time[finger_name]) <= self.max_sample_age_s
@@ -653,16 +650,16 @@ class WeartXHandDirectRetargetingNode(Node):
         return np.clip(q, LOWER, UPPER)
 
     def control_step(self) -> None:
-        if self.zero_tactile_requested.is_set():
-            self.zero_tactile_requested.clear()
+        if self.reset_tactile_requested.is_set():
+            self.reset_tactile_requested.clear()
             now_s = self.now_s()
-            if now_s - self.last_zero_tactile_time >= self.zero_tactile_cooldown_s:
-                self.last_zero_tactile_time = now_s
+            if now_s - self.last_reset_tactile_time >= self.reset_tactile_cooldown_s:
+                self.last_reset_tactile_time = now_s
                 try:
-                    self.driver.tare_tactile_sensors()
-                    self.get_logger().info("XHAND tactile sensors tared (Shift+X).")
+                    self.driver.reset_tactile_sensors_sdk()
+                    self.get_logger().info("XHAND tactile sensors reset via SDK (Shift+X).")
                 except Exception as exc:
-                    self.get_logger().error(f"Failed to zero XHAND tactile sensors: {exc}")
+                    self.get_logger().error(f"Failed to reset XHAND tactile sensors via SDK: {exc}")
 
         if not all(name in self.samples for name in ("thumb", "index", "middle")):
             self.wait_diag_counter += 1
