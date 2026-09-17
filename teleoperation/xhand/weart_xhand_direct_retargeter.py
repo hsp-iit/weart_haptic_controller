@@ -15,14 +15,16 @@ published targets.
 
 from __future__ import annotations
 
+import atexit
 import re
 import select
 import sys
+import termios
 import threading
-import time
+import tty
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 
 import numpy as np
 
@@ -46,23 +48,6 @@ except Exception:
     except Exception:
         xhand_control = None
         XHAND_CONTROLLER_AVAILABLE = False
-
-try:
-    from weartsdk import (
-        TouchEffect,
-        WeArtClient,
-        WeArtCommon,
-        WeArtForce,
-        WeArtHapticObject,
-        WeArtMessages,
-        WeArtTemperature,
-        WeArtTexture,
-    )
-
-    WEART_HAPTICS_AVAILABLE = True
-except Exception:
-    WEART_HAPTICS_AVAILABLE = False
-
 
 FLOAT = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 CLOSURE_RE = re.compile(rf"closure=({FLOAT})")
@@ -114,6 +99,17 @@ def parse_weart_string(text: str) -> WeartSample:
 
 def shaped_closure(closure: float, exponent: float) -> float:
     return clamp(float(closure), 0.0, 1.0) ** max(float(exponent), 1e-3)
+
+
+def normalize_tactile_force(
+    force_vector: np.ndarray,
+    *,
+    full_scale_n: float,
+    deadband_n: float,
+) -> float:
+    magnitude = float(np.linalg.norm(force_vector))
+    value = (magnitude - deadband_n) / max(full_scale_n - deadband_n, 1.0e-9)
+    return float(np.clip(value, 0.0, 1.0))
 
 
 class XHandDirectDriver:
@@ -258,180 +254,12 @@ class XHandDirectDriver:
             )
         return forces
 
-
-class WeartHapticFeedback:
-    def __init__(
-        self,
-        *,
-        enabled: bool,
-        ip: str,
-        port: int,
-        hand_side: str,
-        tactile_full_scale_n: float,
-        tactile_deadband_n: float,
-        smoothing_alpha: float,
-        min_force: float,
-        log_period_s: float,
-    ):
-        self.enabled = bool(enabled)
-        self.ip = str(ip)
-        self.port = int(port)
-        self.hand_side = str(hand_side)
-        self.tactile_full_scale_n = float(tactile_full_scale_n)
-        self.tactile_deadband_n = float(tactile_deadband_n)
-        self.smoothing_alpha = float(smoothing_alpha)
-        self.min_force = float(min_force)
-        self.log_period_s = float(log_period_s)
-        self.client = None
-        self.haptics = {}
-        self.effects = {}
-        self.effect_active = {}
-        self.smoothed = {name: 0.0 for name in ("thumb", "index", "middle")}
-        self.last_log = 0.0
-        self.lock = threading.RLock()
-
-    def connect(self) -> None:
-        if not self.enabled:
-            return
-        if not WEART_HAPTICS_AVAILABLE:
-            raise RuntimeError("Python package 'weartsdk' is not available.")
-        if self.tactile_full_scale_n <= self.tactile_deadband_n:
-            raise ValueError("tactile_full_scale_n must be greater than tactile_deadband_n")
-
-        self.client = WeArtClient(self.ip, self.port)
-        self.client.Run()
-        if not self.client.IsConnected():
-            raise RuntimeError(f"Could not connect to WEART middleware at {self.ip}:{self.port}")
-        self.client.Start()
-
-        temperature = WeArtTemperature()
-        temperature.active = False
-        texture = WeArtTexture(
-            active=False,
-            texture_type=getattr(WeArtCommon.TextureType, "AluminiumFineMeshSlow"),
-            velocity=0.0,
-            volume=0.0,
-        )
-
-        points = {
-            "thumb": WeArtCommon.ActuationPoint.Thumb,
-            "index": WeArtCommon.ActuationPoint.Index,
-            "middle": WeArtCommon.ActuationPoint.Middle,
-        }
-        hand_side_flag = getattr(WeArtCommon.HandSide, self.hand_side)
-        for finger_name, point in points.items():
-            force = WeArtForce(active=True, force=0.0)
-            haptic = WeArtHapticObject(self.client)
-            haptic.handSideFlag = hand_side_flag
-            haptic.actuationPointFlag = point
-            self.haptics[finger_name] = haptic
-            self.effects[finger_name] = TouchEffect(temperature, force, texture)
-            self.effect_active[finger_name] = False
-
-        print(f"[WEART] haptic feedback connected at {self.ip}:{self.port}.", flush=True)
-
-    def disconnect(self) -> None:
-        if not self.enabled:
-            return
-        for finger_name in list(self.effect_active):
-            self.stop_effect(finger_name)
-        if self.client is not None:
-            try:
-                self.client.Stop()
-            except Exception:
-                pass
-            try:
-                self.client.Close()
-            except Exception:
-                pass
-            self.client = None
-            print("[WEART] haptic feedback disconnected.", flush=True)
-
-    def normalize_force(self, force_vector: np.ndarray) -> float:
-        magnitude = float(np.linalg.norm(force_vector))
-        value = (magnitude - self.tactile_deadband_n) / max(
-            self.tactile_full_scale_n - self.tactile_deadband_n,
-            1.0e-9,
-        )
-        return float(np.clip(value, 0.0, 1.0))
-
-    def update(self, tactile_forces: dict[str, np.ndarray]) -> dict[str, float]:
-        if not self.enabled:
-            return {}
-
-        sent = {}
-        for finger_name, force_vector in tactile_forces.items():
-            raw = self.normalize_force(force_vector)
-            previous = self.smoothed.get(finger_name, 0.0)
-            value = self.smoothing_alpha * raw + (1.0 - self.smoothing_alpha) * previous
-            value = float(np.clip(value, 0.0, 1.0))
-            self.smoothed[finger_name] = value
-            sent[finger_name] = value
-            if value <= self.min_force:
-                self.stop_effect(finger_name)
-            else:
-                self.send_force(finger_name, value)
-
-        now = time.monotonic()
-        if self.log_period_s > 0.0 and now - self.last_log >= self.log_period_s:
-            self.last_log = now
-            print(
-                "[WEART] haptic force "
-                + " | ".join(f"{name}={value:.2f}" for name, value in sent.items()),
-                flush=True,
-            )
-        return sent
-
-    def send_force(self, finger_name: str, force_value: float) -> None:
-        if self.client is None or not self.client.IsConnected():
-            return
-        haptic = self.haptics.get(finger_name)
-        effect = self.effects.get(finger_name)
-        if haptic is None or effect is None:
-            return
-        with self.lock:
-            try:
-                temperature = WeArtTemperature()
-                temperature.active = False
-                force = WeArtForce(active=True, force=float(np.clip(force_value, 0.0, 1.0)))
-                texture = WeArtTexture(
-                    active=False,
-                    texture_type=getattr(WeArtCommon.TextureType, "AluminiumFineMeshSlow"),
-                    velocity=0.0,
-                    volume=0.0,
-                )
-                effect.Set(temperature, force, texture)
-                if not self.effect_active.get(finger_name, False):
-                    haptic.AddEffect(effect)
-                    self.effect_active[finger_name] = True
-                haptic.UpdateEffects()
-                haptic.SendMessage(WeArtMessages.SetForceMessage([force_value, 0.0, 0.0]))
-            except Exception as exc:
-                print(f"[WEART] failed to send haptic force for {finger_name}: {exc}", flush=True)
-
-    def stop_effect(self, finger_name: str) -> None:
-        if not self.effect_active.get(finger_name, False):
-            return
-        haptic = self.haptics.get(finger_name)
-        effect = self.effects.get(finger_name)
-        if haptic is None or effect is None:
-            return
-        with self.lock:
-            try:
-                haptic.RemoveEffect(effect)
-                haptic.SendMessage(WeArtMessages.StopForceMessage())
-            except Exception as exc:
-                print(f"[WEART] failed to stop haptic force for {finger_name}: {exc}", flush=True)
-            finally:
-                self.effect_active[finger_name] = False
-
-
 class WeartXHandDirectRetargetingNode(Node):
     def __init__(self):
         super().__init__("weart_xhand_direct_retargeter")
 
         self.declare_parameter("control_rate_hz", 30.0)
-        self.declare_parameter("enable_hardware", False)
+        self.declare_parameter("enable_hardware", True)
         self.declare_parameter("hand_id", 0)
         self.declare_parameter("protocol", "EtherCAT")
         self.declare_parameter("ethercat_ifname", "")
@@ -448,18 +276,11 @@ class WeartXHandDirectRetargetingNode(Node):
         self.declare_parameter("max_speed_rad_s", 1.5)
         self.declare_parameter("mirror_middle_to_ring_little", True)
         self.declare_parameter("max_sample_age_s", 0.30)
-        self.declare_parameter("publish_xhand_tactile", False)
-        self.declare_parameter("enable_weart_haptics", False)
-        self.declare_parameter("weart_ip", "127.0.0.1")
-        self.declare_parameter("weart_port", 13031)
-        self.declare_parameter("weart_hand_side", "Right")
+        self.declare_parameter("publish_xhand_tactile", True)
         self.declare_parameter("tactile_rate_hz", 20.0)
         self.declare_parameter("tactile_full_scale_n", 8.0)
         self.declare_parameter("tactile_deadband_n", 0.0)
-        self.declare_parameter("haptic_smoothing_alpha", 0.25)
-        self.declare_parameter("haptic_min_force", 0.02)
-        self.declare_parameter("haptic_log_period_s", 1.0)
-        self.declare_parameter("enable_voice_tactile_reset", False)
+        self.declare_parameter("enable_voice_tactile_reset", True)
         self.declare_parameter("voice_tactile_reset_topic", "/speech/recognized")
         self.declare_parameter("voice_tactile_reset_phrase", "azzera")
 
@@ -470,6 +291,8 @@ class WeartXHandDirectRetargetingNode(Node):
         self.mirror_middle = bool(self.get_parameter("mirror_middle_to_ring_little").value)
         self.max_sample_age_s = float(self.get_parameter("max_sample_age_s").value)
         self.publish_xhand_tactile = bool(self.get_parameter("publish_xhand_tactile").value)
+        self.tactile_full_scale_n = float(self.get_parameter("tactile_full_scale_n").value)
+        self.tactile_deadband_n = float(self.get_parameter("tactile_deadband_n").value)
         self.enable_voice_tactile_reset = bool(self.get_parameter("enable_voice_tactile_reset").value)
         self.voice_tactile_reset_phrase = str(
             self.get_parameter("voice_tactile_reset_phrase").value
@@ -496,19 +319,6 @@ class WeartXHandDirectRetargetingNode(Node):
         )
         self.driver.connect()
 
-        self.haptics = WeartHapticFeedback(
-            enabled=bool(self.get_parameter("enable_weart_haptics").value),
-            ip=str(self.get_parameter("weart_ip").value),
-            port=int(self.get_parameter("weart_port").value),
-            hand_side=str(self.get_parameter("weart_hand_side").value),
-            tactile_full_scale_n=float(self.get_parameter("tactile_full_scale_n").value),
-            tactile_deadband_n=float(self.get_parameter("tactile_deadband_n").value),
-            smoothing_alpha=float(self.get_parameter("haptic_smoothing_alpha").value),
-            min_force=float(self.get_parameter("haptic_min_force").value),
-            log_period_s=float(self.get_parameter("haptic_log_period_s").value),
-        )
-        self.haptics.connect()
-
         for finger in ("thumb", "index", "middle"):
             self.create_subscription(
                 String,
@@ -525,7 +335,7 @@ class WeartXHandDirectRetargetingNode(Node):
             )
 
         self.target_pub = self.create_publisher(Float64MultiArray, "/xhand/target_joint_positions", 20)
-        self.haptic_pub = self.create_publisher(Float64MultiArray, "/xhand/tactile_normalized", 20)
+        self.tactile_norm_pub = self.create_publisher(Float64MultiArray, "/xhand/tactile_normalized", 20)
         self.tactile_raw_pub = self.create_publisher(Float64MultiArray, "/xhand/tactile_force_norms", 20)
         self.diag_counter = 0
         self.wait_diag_counter = 0
@@ -534,7 +344,7 @@ class WeartXHandDirectRetargetingNode(Node):
         self.timer = self.create_timer(1.0 / max(rate_hz, 1.0), self.control_step)
         tactile_rate_hz = float(self.get_parameter("tactile_rate_hz").value)
         self.tactile_timer = None
-        if self.publish_xhand_tactile or self.haptics.enabled:
+        if self.publish_xhand_tactile:
             self.tactile_timer = self.create_timer(
                 1.0 / max(tactile_rate_hz, 1.0),
                 self.tactile_step,
@@ -545,6 +355,8 @@ class WeartXHandDirectRetargetingNode(Node):
         self.last_reset_tactile_time = -float("inf")
         self.keyboard_stop = threading.Event()
         self.keyboard_thread = None
+        self.keyboard_fd = None
+        self.keyboard_original_settings = None
         if self.driver.enabled:
             self.start_keyboard_listener()
 
@@ -553,9 +365,7 @@ class WeartXHandDirectRetargetingNode(Node):
             self.get_logger().warning("XHAND HARDWARE OUTPUT ENABLED.")
         else:
             self.get_logger().warning("Dry-run mode: publishing /xhand/target_joint_positions only.")
-        if self.haptics.enabled:
-            self.get_logger().warning("WEART HAPTIC FEEDBACK ENABLED.")
-        elif self.publish_xhand_tactile:
+        if self.publish_xhand_tactile:
             self.get_logger().info("Publishing XHAND tactile values on /xhand/tactile_normalized.")
 
     def start_keyboard_listener(self) -> None:
@@ -565,6 +375,10 @@ class WeartXHandDirectRetargetingNode(Node):
             )
             return
 
+        self.keyboard_fd = sys.stdin.fileno()
+        self.keyboard_original_settings = termios.tcgetattr(self.keyboard_fd)
+        tty.setcbreak(self.keyboard_fd)
+        atexit.register(self.restore_keyboard_terminal)
         self.keyboard_thread = threading.Thread(
             target=self.keyboard_listener_loop,
             daemon=True,
@@ -573,13 +387,7 @@ class WeartXHandDirectRetargetingNode(Node):
         self.get_logger().info("Press Shift+X to reset XHAND tactile sensors via SDK.")
 
     def keyboard_listener_loop(self) -> None:
-        import termios
-        import tty
-
-        fd = sys.stdin.fileno()
-        original_settings = termios.tcgetattr(fd)
         try:
-            tty.setcbreak(fd)
             while not self.keyboard_stop.is_set():
                 ready, _, _ = select.select([sys.stdin], [], [], 0.1)
                 if not ready:
@@ -589,8 +397,21 @@ class WeartXHandDirectRetargetingNode(Node):
                     self.reset_tactile_requested.set()
         except Exception as exc:
             self.get_logger().warning(f"Keyboard listener stopped: {exc}")
+
+    def restore_keyboard_terminal(self) -> None:
+        if self.keyboard_fd is None or self.keyboard_original_settings is None:
+            return
+        try:
+            termios.tcsetattr(
+                self.keyboard_fd,
+                termios.TCSADRAIN,
+                self.keyboard_original_settings,
+            )
+        except Exception as exc:
+            self.get_logger().warning(f"Failed to restore terminal settings: {exc}")
         finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, original_settings)
+            self.keyboard_fd = None
+            self.keyboard_original_settings = None
 
     def now_s(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
@@ -717,7 +538,11 @@ class WeartXHandDirectRetargetingNode(Node):
             return
 
         normalized = {
-            name: self.haptics.normalize_force(force_vector)
+            name: normalize_tactile_force(
+                force_vector,
+                full_scale_n=self.tactile_full_scale_n,
+                deadband_n=self.tactile_deadband_n,
+            )
             for name, force_vector in tactile_forces.items()
         }
         raw_msg = Float64MultiArray()
@@ -727,21 +552,20 @@ class WeartXHandDirectRetargetingNode(Node):
         ]
         self.tactile_raw_pub.publish(raw_msg)
 
-        if self.haptics.enabled:
-            normalized = self.haptics.update(tactile_forces)
-
         msg = Float64MultiArray()
         msg.data = [
             float(normalized.get("thumb", 0.0)),
             float(normalized.get("index", 0.0)),
             float(normalized.get("middle", 0.0)),
         ]
-        self.haptic_pub.publish(msg)
+        self.tactile_norm_pub.publish(msg)
 
     def destroy_node(self):
         self.keyboard_stop.set()
+        if self.keyboard_thread is not None and self.keyboard_thread.is_alive():
+            self.keyboard_thread.join(timeout=0.5)
+        self.restore_keyboard_terminal()
         try:
-            self.haptics.disconnect()
             self.driver.disconnect()
         finally:
             return super().destroy_node()
