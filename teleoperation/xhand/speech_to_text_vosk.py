@@ -29,7 +29,7 @@ except ImportError:
 
 
 DEFAULT_MODEL_URL = "https://alphacephei.com/kaldi/models/vosk-model-small-it-0.22.zip"
-DEFAULT_MODEL_DIR = Path("/usr/local/robot/weart_haptic_controller/models/vosk-model-small-it-0.22")
+DEFAULT_MODEL_DIR = Path("/home/panda-admin/users/sberti/weart_haptic_controller/models/vosk-model-small-it-0.22")
 
 
 def ensure_vosk_imported():

@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-WEART -> Robotera XHAND direct retargeting ROS 2 node.
+WEART retargeting + Robotera XHAND EtherCAT bridge.
 
-This is the first, hardware-oriented bridge:
+It can operate in three modes:
   - subscribe to the existing WEART raw String topics;
   - map normalized WEART closure/adduction to the 12 XHAND joints;
-  - publish the commanded 12-joint target on /xhand/target_joint_positions;
-  - optionally send the command to the real hand through Robotera's
-    xhand_controller Python binding.
-
-Hardware output is disabled by default. Enable it only after checking the
-published targets.
+  - standalone (default): map WEART and command XHAND directly;
+  - lerobot_control_mode: publish the WEART proposal, but command hardware
+    only after PandaEE.send_action() returns it on the LeRobot command topic;
+  - replay_mode: ignore WEART and execute replay/policy targets.
 """
 
 from __future__ import annotations
@@ -232,9 +230,17 @@ class XHandDirectDriver:
                 flush=True,
             )
 
-    def read_tactile_forces(self, force_update: bool = False) -> dict[str, np.ndarray]:
+    def read_measured_state(
+        self, force_update: bool = False
+    ) -> tuple[np.ndarray, dict[str, np.ndarray], dict[str, np.ndarray]]:
+        """Return 12 joints, resultant fingertip forces, and every tactile taxel.
+
+        ``calc_force`` is the SDK's force resultant for one fingertip.  In
+        contrast, ``raw_force`` contains the 120 individual force vectors of
+        that fingertip, ordered exactly as supplied by the Robotera SDK.
+        """
         if not self.enabled:
-            return {}
+            return np.zeros(12, dtype=float), {}, {}
         if self.dev is None:
             raise RuntimeError("XHAND is not connected.")
 
@@ -242,17 +248,25 @@ class XHandDirectDriver:
         if reply.error_code != 0:
             raise RuntimeError(f"Failed to read XHAND state: {reply.error_message}")
 
-        # Robotera SDK exposes sensor_data[0..4] in fingertip order:
-        # thumb, index, middle, ring, little. This is the same convention used
-        # by the LeRobot XHand wrapper.
-        forces = {}
-        for sensor_index, finger_name in enumerate(("thumb", "index", "middle")):
-            force = state.sensor_data[sensor_index].calc_force
+        joints = np.array([float(finger.position) for finger in state.finger_state], dtype=float)
+        if joints.size < 12:
+            raise RuntimeError(f"XHAND returned {joints.size} joints; expected 12.")
+
+        # Robotera SDK exposes sensor_data[0..4] in fingertip order.
+        forces: dict[str, np.ndarray] = {}
+        raw_forces: dict[str, np.ndarray] = {}
+        for sensor_index, finger_name in enumerate(("thumb", "index", "middle", "ring", "little")):
+            sensor = state.sensor_data[sensor_index]
+            force = sensor.calc_force
             forces[finger_name] = np.array(
                 [float(force.fx), float(force.fy), float(force.fz)],
                 dtype=float,
             )
-        return forces
+            raw_forces[finger_name] = np.array(
+                [[float(taxel.fx), float(taxel.fy), float(taxel.fz)] for taxel in sensor.raw_force],
+                dtype=float,
+            )
+        return joints[:12], forces, raw_forces
 
 class WeartXHandDirectRetargetingNode(Node):
     def __init__(self):
@@ -283,6 +297,11 @@ class WeartXHandDirectRetargetingNode(Node):
         self.declare_parameter("enable_voice_tactile_reset", True)
         self.declare_parameter("voice_tactile_reset_topic", "/speech/recognized")
         self.declare_parameter("voice_tactile_reset_phrase", "azzera")
+        # In this mode WEART only generates proposed joint targets. LeRobot
+        # must echo them through replay_joint_topic before EtherCAT is driven.
+        self.declare_parameter("lerobot_control_mode", False)
+        self.declare_parameter("replay_mode", False)
+        self.declare_parameter("replay_joint_topic", "/xhand/replay_joint_positions")
 
         self.closure_scale = float(self.get_parameter("closure_scale").value)
         self.closure_exponent = float(self.get_parameter("closure_exponent").value)
@@ -297,12 +316,20 @@ class WeartXHandDirectRetargetingNode(Node):
         self.voice_tactile_reset_phrase = str(
             self.get_parameter("voice_tactile_reset_phrase").value
         ).strip().lower()
+        self.lerobot_control_mode = bool(self.get_parameter("lerobot_control_mode").value)
+        self.replay_mode = bool(self.get_parameter("replay_mode").value)
+        self.replay_joint_topic = str(self.get_parameter("replay_joint_topic").value)
+        if self.lerobot_control_mode and self.replay_mode:
+            raise ValueError("lerobot_control_mode and replay_mode are mutually exclusive")
 
         self.samples: Dict[str, WeartSample] = {}
         self.last_rx_time: Dict[str, float] = {}
         self.seen_first_sample = set()
         self.current_q = np.zeros(12, dtype=float)
+        self.weart_target_q = np.zeros(12, dtype=float)
+        self.replay_target: np.ndarray | None = None
         self.last_control_time_s = self.now_s()
+        self.last_weart_target_time_s = self.last_control_time_s
 
         self.driver = XHandDirectDriver(
             enabled=bool(self.get_parameter("enable_hardware").value),
@@ -318,12 +345,23 @@ class WeartXHandDirectRetargetingNode(Node):
             control_mode=int(self.get_parameter("control_mode").value),
         )
         self.driver.connect()
+        if self.driver.enabled:
+            measured_q, _, _ = self.driver.read_measured_state(force_update=False)
+            self.current_q = np.clip(measured_q, LOWER, UPPER)
+            self.weart_target_q = self.current_q.copy()
 
         for finger in ("thumb", "index", "middle"):
             self.create_subscription(
                 String,
                 f"/weart/{finger}/raw",
                 lambda msg, finger_name=finger: self.weart_callback(finger_name, msg),
+                20,
+            )
+        if self.replay_mode or self.lerobot_control_mode:
+            self.create_subscription(
+                Float64MultiArray,
+                self.replay_joint_topic,
+                self.replay_joint_callback,
                 20,
             )
         if self.enable_voice_tactile_reset:
@@ -335,6 +373,16 @@ class WeartXHandDirectRetargetingNode(Node):
             )
 
         self.target_pub = self.create_publisher(Float64MultiArray, "/xhand/target_joint_positions", 20)
+        self.weart_target_pub = self.create_publisher(
+            Float64MultiArray, "/xhand/weart_joint_positions", 20
+        )
+        # Measured state for recorder consumers. This node is the only EtherCAT
+        # owner, so downstream processes must subscribe instead of opening XHand.
+        self.joint_state_pub = self.create_publisher(Float64MultiArray, "/xhand/joint_positions", 20)
+        self.tactile_force_pub = self.create_publisher(Float64MultiArray, "/xhand/tactile_forces", 20)
+        self.tactile_raw_vectors_pub = self.create_publisher(
+            Float64MultiArray, "/xhand/tactile_raw_forces", 20
+        )
         self.tactile_norm_pub = self.create_publisher(Float64MultiArray, "/xhand/tactile_normalized", 20)
         self.tactile_raw_pub = self.create_publisher(Float64MultiArray, "/xhand/tactile_force_norms", 20)
         self.diag_counter = 0
@@ -367,6 +415,15 @@ class WeartXHandDirectRetargetingNode(Node):
             self.get_logger().warning("Dry-run mode: publishing /xhand/target_joint_positions only.")
         if self.publish_xhand_tactile:
             self.get_logger().info("Publishing XHAND tactile values on /xhand/tactile_normalized.")
+        if self.replay_mode:
+            self.get_logger().warning(
+                f"XHAND REPLAY MODE: ignoring WEART commands; listening on {self.replay_joint_topic}."
+            )
+        if self.lerobot_control_mode:
+            self.get_logger().warning(
+                "XHAND LEROBOT CONTROL MODE: WEART publishes proposed targets on "
+                f"/xhand/weart_joint_positions; hardware moves only from {self.replay_joint_topic}."
+            )
 
     def start_keyboard_listener(self) -> None:
         if not sys.stdin.isatty():
@@ -433,6 +490,16 @@ class WeartXHandDirectRetargetingNode(Node):
             self.reset_tactile_requested.set()
             self.get_logger().info(f"Voice tactile reset requested: {msg.data!r}")
 
+    def replay_joint_callback(self, msg: Float64MultiArray) -> None:
+        values = np.asarray(msg.data, dtype=float)
+        if values.size != 12 or not np.all(np.isfinite(values)):
+            self.get_logger().warning(
+                f"Ignoring invalid XHAND replay target with {values.size} values.",
+                throttle_duration_sec=1.0,
+            )
+            return
+        self.replay_target = np.clip(values, LOWER, UPPER)
+
     def sample_is_fresh(self, finger_name: str) -> bool:
         return finger_name in self.last_rx_time and (self.now_s() - self.last_rx_time[finger_name]) <= self.max_sample_age_s
 
@@ -470,6 +537,67 @@ class WeartXHandDirectRetargetingNode(Node):
 
         return np.clip(q, LOWER, UPPER)
 
+    def weart_samples_ready(self) -> bool:
+        required = ("thumb", "index", "middle")
+        if not all(name in self.samples for name in required):
+            self.wait_diag_counter += 1
+            if self.wait_diag_counter % 60 == 0:
+                missing = [name for name in required if name not in self.samples]
+                self.get_logger().warning("Waiting for WEART samples on: " + ", ".join(missing))
+            return False
+        if not all(self.sample_is_fresh(name) for name in required):
+            self.get_logger().warning(
+                "WEART data stale; holding XHAND target.", throttle_duration_sec=2.0
+            )
+            return False
+        return True
+
+    def publish_weart_target(self) -> None:
+        """Publish a safe WEART-derived proposal without touching hardware."""
+        if self.weart_samples_ready():
+            now_s = self.now_s()
+            dt = max(now_s - self.last_weart_target_time_s, 1e-3)
+            self.last_weart_target_time_s = now_s
+            target = self.target_from_samples()
+            low_pass = self.weart_target_q + self.low_pass_alpha * (
+                target - self.weart_target_q
+            )
+            max_step = np.minimum(VELOCITY, self.max_speed_rad_s) * dt
+            self.weart_target_q = np.clip(
+                self.weart_target_q
+                + np.clip(low_pass - self.weart_target_q, -max_step, max_step),
+                LOWER,
+                UPPER,
+            )
+
+        msg = Float64MultiArray()
+        msg.data = [float(value) for value in self.weart_target_q]
+        self.weart_target_pub.publish(msg)
+
+    def execute_external_target(self) -> None:
+        """Apply only the command received from PandaEE.send_action()."""
+        if self.replay_target is None:
+            return
+        now_s = self.now_s()
+        dt = max(now_s - self.last_control_time_s, 1e-3)
+        self.last_control_time_s = now_s
+        low_pass = self.current_q + self.low_pass_alpha * (self.replay_target - self.current_q)
+        max_step = np.minimum(VELOCITY, self.max_speed_rad_s) * dt
+        self.current_q = np.clip(
+            self.current_q + np.clip(low_pass - self.current_q, -max_step, max_step),
+            LOWER,
+            UPPER,
+        )
+        msg = Float64MultiArray()
+        msg.data = [float(value) for value in self.current_q]
+        self.target_pub.publish(msg)
+        try:
+            self.driver.command(self.current_q)
+        except Exception as exc:
+            self.get_logger().error(
+                f"XHAND external command failed: {exc}", throttle_duration_sec=1.0
+            )
+
     def control_step(self) -> None:
         if self.reset_tactile_requested.is_set():
             self.reset_tactile_requested.clear()
@@ -482,20 +610,16 @@ class WeartXHandDirectRetargetingNode(Node):
                 except Exception as exc:
                     self.get_logger().error(f"Failed to reset XHAND tactile sensors via SDK: {exc}")
 
-        if not all(name in self.samples for name in ("thumb", "index", "middle")):
-            self.wait_diag_counter += 1
-            if self.wait_diag_counter % 60 == 0:
-                missing = [
-                    name
-                    for name in ("thumb", "index", "middle")
-                    if name not in self.samples
-                ]
-                self.get_logger().warning(
-                    "Waiting for WEART samples on: " + ", ".join(missing)
-                )
+        if self.lerobot_control_mode:
+            self.publish_weart_target()
+            self.execute_external_target()
             return
-        if not all(self.sample_is_fresh(name) for name in ("thumb", "index", "middle")):
-            self.get_logger().warning("WEART data stale; not sending XHAND target.", throttle_duration_sec=2.0)
+
+        if self.replay_mode:
+            self.execute_external_target()
+            return
+
+        if not self.weart_samples_ready():
             return
 
         now_s = self.now_s()
@@ -510,6 +634,7 @@ class WeartXHandDirectRetargetingNode(Node):
         msg = Float64MultiArray()
         msg.data = [float(v) for v in self.current_q]
         self.target_pub.publish(msg)
+        self.weart_target_pub.publish(msg)
 
         try:
             self.driver.command(self.current_q)
@@ -529,13 +654,38 @@ class WeartXHandDirectRetargetingNode(Node):
 
     def tactile_step(self) -> None:
         try:
-            tactile_forces = self.driver.read_tactile_forces(force_update=False)
+            measured_joints, tactile_forces, tactile_raw_forces = self.driver.read_measured_state(
+                force_update=False
+            )
         except Exception as exc:
             self.get_logger().warning(
                 f"XHAND tactile read failed: {exc}",
                 throttle_duration_sec=1.0,
             )
             return
+
+        joint_msg = Float64MultiArray()
+        joint_msg.data = [float(value) for value in measured_joints]
+        self.joint_state_pub.publish(joint_msg)
+
+        tactile_msg = Float64MultiArray()
+        tactile_msg.data = [
+            float(value)
+            for finger_name in ("thumb", "index", "middle", "ring", "little")
+            for value in tactile_forces.get(finger_name, np.zeros(3))
+        ]
+        self.tactile_force_pub.publish(tactile_msg)
+
+        # Five fingertips × 120 taxels × (fx, fy, fz).  Ordering is
+        # thumb/index/middle/ring/little, then the SDK's taxel order, then xyz.
+        raw_vectors_msg = Float64MultiArray()
+        raw_vectors_msg.data = [
+            float(component)
+            for finger_name in ("thumb", "index", "middle", "ring", "little")
+            for taxel in tactile_raw_forces.get(finger_name, np.zeros((120, 3)))
+            for component in taxel
+        ]
+        self.tactile_raw_vectors_pub.publish(raw_vectors_msg)
 
         normalized = {
             name: normalize_tactile_force(
